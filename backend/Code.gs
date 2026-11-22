@@ -1,5 +1,5 @@
 /**
- * At-Taqwa Somiti — App API (Phase 2)
+ * At-Taqwa Somiti — App API (Phase 3)
  * Standalone Google Apps Script project. It opens your Google Sheet by ID,
  * so it never clashes with the script already inside the sheet.
  *
@@ -16,7 +16,8 @@ const CFG = {
   TABS: {
     DASH: 'Dashboard', RECEIVE: 'Receive', INFO: 'INFORMATION', EXP: 'Expenses',
     USERS: 'App_Users', ACCTS: 'App_Accounts', AUDIT: 'App_Audit_Log',
-    SMS: 'App_SMS_Log', SETTINGS: 'App_Settings', CASH: 'App_Cashbook', RECON: 'App_Reconcile'
+    SMS: 'App_SMS_Log', SETTINGS: 'App_Settings', CASH: 'App_Cashbook', RECON: 'App_Reconcile',
+    VOID: 'App_Voided', PENDING: 'App_Pending', DOCS: 'App_Documents', PAYIN: 'Payment Entry'
   },
   MOSJID_ID: 'ATFS-0000',
   SESSION_SECONDS: 6 * 60 * 60,
@@ -42,8 +43,14 @@ const DEFAULT_SETTINGS = [
   ['REMINDER_MIN_MONTHS', 1, 'Remind when at least this many months due'],
   ['INACTIVE_AFTER_MONTHS', 6, 'Flag member Inactive at this many months due'],
   ['GITHUB_BACKUP_REPO', 'alihaider-dev/attaqwa-somiti-backup', 'e.g. alihaider-dev/attaqwa-somiti-backup (private)'],
-  ['DRIVE_BACKUP_KEEP', 8, 'How many weekly Drive copies to keep']
+  ['DRIVE_BACKUP_KEEP', 8, 'How many weekly Drive copies to keep'],
+  ['ALERT_PHONE', '', 'Admin mobile for alerts (01XXXXXXXXX)'],
+  ['ALERT_OVER', 5000, 'SMS the admin for any payment/expense at or above this (Tk)'],
+  ['APPROVAL_OVER', 5000, 'Expenses at or above this need a second person to approve (0 = off)']
 ];
+const VOID_COLS = ['Voided At', 'Voided By', 'Reason', 'Tab', 'Receipt', 'MID', 'Amount', 'Original Row (JSON)'];
+const PENDING_COLS = ['ID', 'Created At', 'Created By', 'Kind', 'Data', 'Status', 'Decided By', 'Decided At', 'Note'];
+const DOC_COLS = ['MID', 'Type', 'File ID', 'File Name', 'Uploaded At', 'Uploaded By'];
 
 /* ---------------- helpers ---------------- */
 function props_() { return PropertiesService.getScriptProperties(); }
@@ -138,6 +145,9 @@ function setup() {
   ensure(CFG.TABS.SMS, ['Time', 'To', 'Number', 'Message', 'Result']);
   ensure(CFG.TABS.CASH, CASH_COLS);
   ensure(CFG.TABS.RECON, RECON_COLS);
+  ensure(CFG.TABS.VOID, VOID_COLS);
+  ensure(CFG.TABS.PENDING, PENDING_COLS);
+  ensure(CFG.TABS.DOCS, DOC_COLS);
   const st = ensure(CFG.TABS.SETTINGS, ['Key', 'Value', 'Note']);
   const haveKeys = new Set(st.getDataRange().getValues().map(r => String(r[0]).trim()));
   const addKeys = DEFAULT_SETTINGS.filter(r => !haveKeys.has(r[0]));
@@ -259,7 +269,20 @@ function doPost(e) {
         reconcile: () => { requireAdmin_(u); return reconcile_(u, b); },
         reminders: () => { requireAdmin_(u); return reminders_(u, !!b.send); },
         backupStatus: () => { requireAdmin_(u); return backupStatus_(); },
-        backupNow: () => { requireAdmin_(u); return backupFull_('manual'); }
+        backupNow: () => { requireAdmin_(u); return backupFull_('manual'); },
+        // Phase 3
+        voidEntry: () => { requireAdmin_(u); return voidEntry_(u, b); },
+        closeAccount: () => { requireAdmin_(u); return closeAccount_(u, b); },
+        closePreview: () => { requireAdmin_(u); return closePreview_(b.mid); },
+        pending: () => { if (!isStaff_(u)) throw new Error('Not allowed'); return listPending_(); },
+        decide: () => decidePending_(u, b.id, !!b.approve, b.note),
+        monthReport: () => { if (!isStaff_(u)) throw new Error('Not allowed'); return monthReport_(b.month); },
+        collectorNames: () => { if (!isStaff_(u)) throw new Error('Not allowed'); return collectorNames_(); },
+        docs: () => listDocs_(u, b.mid),
+        doc: () => getDoc_(u, b.fileId),
+        uploadDoc: () => { requireAdmin_(u); return uploadDoc_(u, b); },
+        dataHealth: () => { requireAdmin_(u); return dataHealth_(); },
+        setUserPhone: () => { requireAdmin_(u); return setUserPhone_(u, b.userId, b.phone); }
       };
       if (!routes[action]) throw new Error('Unknown action');
       out = routes[action]();
@@ -390,7 +413,7 @@ function ledger_(u, mid) {
   const don = mid === CFG.MOSJID_ID ? [] : receiveRows_().filter(r => r.mid === CFG.MOSJID_ID && r.donorId === mid).sort((a, b) => b.date - a.date);
   return {
     mid, name: info.name, phone: isStaff_(u) ? info.phone : '', summary,
-    entries: rows.map(r => ({ date: fmtDate_(r.date), forMonth: fmtMonth_(r.forMonth), deposit: r.deposit, sc: r.sc, remarks: r.remarks, receipt: r.receipt })),
+    entries: rows.map(r => ({ row: r.row, date: fmtDate_(r.date), forMonth: fmtMonth_(r.forMonth), deposit: r.deposit, sc: r.sc, remarks: r.remarks, receipt: r.receipt, collectedBy: r.collectedBy })),
     donations: don.map(r => ({ date: fmtDate_(r.date), amount: r.deposit, receipt: r.receipt }))
   };
 }
@@ -398,7 +421,7 @@ function ledger_(u, mid) {
 function transactions_(limit) {
   const rows = receiveRows_();
   rows.sort((a, b) => (b.date - a.date) || (b.row - a.row));
-  return rows.slice(0, Math.min(limit, 300)).map(r => ({ date: fmtDate_(r.date), forMonth: fmtMonth_(r.forMonth), mid: r.mid, name: r.name, deposit: r.deposit, sc: r.sc, remarks: r.remarks, receipt: r.receipt, collectedBy: r.collectedBy }));
+  return rows.slice(0, Math.min(limit, 300)).map(r => ({ row: r.row, date: fmtDate_(r.date), forMonth: fmtMonth_(r.forMonth), mid: r.mid, name: r.name, deposit: r.deposit, sc: r.sc, remarks: r.remarks, receipt: r.receipt, collectedBy: r.collectedBy }));
 }
 
 /* ---------------- payments ---------------- */
@@ -489,6 +512,7 @@ function addPayment_(u, b) {
     const s = smsToHolder_(mid, msg);
     result.sms = s.sms; result.wa = s.wa; result.waOnly = s.waOnly;
   }
+  if (result.total >= (num_(getSettings_().ALERT_OVER) || Infinity)) alert_('Payment ' + result.receipt + ': ' + result.total.toLocaleString('en-US') + ' Tk from ' + result.mid + ' (' + result.name + ').');
   return result;
 }
 
@@ -739,12 +763,12 @@ function expenseRows_() {
   if (last < 2) return [];
   return s.getRange(2, 1, last - 1, 9).getValues().map((r, i) => ({
     row: i + 2, date: toDate_(r[0]), purpose: String(r[1] || ''), amount: num_(r[2]), remarks: String(r[3] || ''),
-    fund: String(r[4] || '') === 'Mosjid' ? 'Mosjid' : 'Somiti', paidFrom: String(r[5] || '').trim(), voucher: String(r[6] || ''), by: String(r[8] || '')
+    fund: ['Mosjid', 'Withdrawal'].indexOf(String(r[4] || '')) >= 0 ? String(r[4]) : 'Somiti', paidFrom: String(r[5] || '').trim(), voucher: String(r[6] || ''), by: String(r[8] || '')
   })).filter(x => x.amount);
 }
 function listExpenses_(limit) {
   const rows = expenseRows_().sort((a, b) => (b.date - a.date) || (b.row - a.row));
-  const tot = { Somiti: 0, Mosjid: 0 }; rows.forEach(r => tot[r.fund] += r.amount);
+  const tot = { Somiti: 0, Mosjid: 0, Withdrawal: 0 }; rows.forEach(r => tot[r.fund] += r.amount);
   return { totals: tot, rows: rows.slice(0, limit).map(r => Object.assign({}, r, { date: fmtDate_(r.date) })) };
 }
 function addExpense_(u, b) {
@@ -754,7 +778,20 @@ function addExpense_(u, b) {
   const purpose = String(b.purpose || '').trim(); if (!purpose) throw new Error('Enter the purpose');
   const fund = b.fund === 'Mosjid' ? 'Mosjid' : 'Somiti'; // Dashboard counts "Mosjid" vs everything else
   const acct = checkAccount_(b.paidFrom);
-  const date = toDate_(b.date) || new Date();
+  const d = toDate_(b.date) || new Date();
+  const data = { date: Utilities.formatDate(d, tz_(), 'yyyy-MM-dd'), purpose, amount, fund, paidFrom: acct, remarks: String(b.remarks || '') };
+  const limit = num_(getSettings_().APPROVAL_OVER);
+  if (limit > 0 && amount >= limit) {
+    const id = 'PND-' + Utilities.formatDate(new Date(), tz_(), 'yyMMddHHmmss');
+    sh_(CFG.TABS.PENDING).appendRow([id, new Date(), u.UserID, 'expense', JSON.stringify(data), 'pending', '', '', '']);
+    audit_(u, 'expense_pending', { id, amount, purpose });
+    alert_('Expense waiting for approval: ' + amount.toLocaleString('en-US') + ' Tk, ' + purpose + ' (by ' + u.UserID + ').');
+    return { pending: true, id, amount };
+  }
+  return writeExpense_(u, data, '');
+}
+
+function writeExpense_(u, data, approvedBy) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) throw new Error('Another save is running. Try again in a moment.');
   let voucher;
@@ -762,14 +799,16 @@ function addExpense_(u, b) {
     const s = sh_(CFG.TABS.EXP);
     const row = lastFilledRow_(s, 3) + 1;
     voucher = nextReceipt_().replace(/^[A-Z]+/, 'EXP');
-    s.getRange(row, 1, 1, 9).setValues([[date, purpose, amount, String(b.remarks || ''), fund, acct, voucher, new Date(), u.UserID]]);
+    const remarks = data.remarks + (approvedBy ? (data.remarks ? ' · ' : '') + 'approved by ' + approvedBy : '');
+    s.getRange(row, 1, 1, 9).setValues([[toDate_(data.date) || new Date(), data.purpose, data.amount, remarks, data.fund, data.paidFrom, voucher, new Date(), u.UserID]]);
     s.getRange(row, 1).setNumberFormat('d-mmm-yyyy');
     SpreadsheetApp.flush();
-    if (num_(s.getRange(row, 3).getValue()) !== amount) throw new Error('Save check failed. Check the Expenses tab.');
-    audit_(u, 'add_expense', { voucher, amount, fund, acct, purpose });
+    if (num_(s.getRange(row, 3).getValue()) !== data.amount) throw new Error('Save check failed. Check the Expenses tab.');
+    audit_(u, 'add_expense', { voucher, amount: data.amount, fund: data.fund, acct: data.paidFrom, purpose: data.purpose, approvedBy });
     markDirty_();
   } finally { lock.releaseLock(); }
-  return { voucher, amount, fund, paidFrom: acct };
+  if (data.amount >= (num_(getSettings_().ALERT_OVER) || Infinity)) alert_('Expense ' + voucher + ': ' + data.amount.toLocaleString('en-US') + ' Tk, ' + data.purpose + ' (' + data.fund + ', from ' + data.paidFrom + ').');
+  return { voucher, amount: data.amount, fund: data.fund, paidFrom: data.paidFrom };
 }
 
 /* ---------------- cash book (where the money is) ---------------- */
@@ -794,8 +833,17 @@ function cashbook_() {
     else if (r.Type === 'TRANSFER') { add(r.From, -amt); add(r.To, amt); }
     else if (r.Type === 'BANK_PROFIT') { add(r.To, amt); profit += amt; }
     else if (r.Type === 'BANK_CHARGE') { add(r.From, -amt); charges += amt; }
+    else if (r.Type === 'HANDOVER' && r.To && r.To !== accts[0]) { add(accts[0], -amt); add(r.To, amt); }
   });
-  receiveRows_().forEach(r => { if (r.date && r.date >= start) { const v = r.deposit + r.sc; add(r.account || accts[0], v); inflow += v; } });
+  const held = {}; const key = n => String(n || '').trim().toLowerCase();
+  const label = {};
+  receiveRows_().forEach(r => {
+    if (r.date && r.date >= start) {
+      const v = r.deposit + r.sc; const a = r.account || accts[0]; add(a, v); inflow += v;
+      if (a === accts[0] && key(r.collectedBy)) { const k = key(r.collectedBy); held[k] = (held[k] || 0) + v; label[k] = label[k] || r.collectedBy.trim(); }
+    }
+  });
+  cash.forEach(r => { if (r.Type === 'HANDOVER' && r.d >= start) { const k = key(r.Note.split('|')[0]); held[k] = (held[k] || 0) - num_(r.Amount); label[k] = label[k] || r.Note.split('|')[0].trim(); } });
   expenseRows_().forEach(r => { if (r.date && r.date >= start) { add(r.paidFrom || accts[0], -r.amount); outflow += r.amount; } });
   const total = Object.keys(bal).reduce((t, a) => t + bal[a], 0);
   let dashTotal = null;
@@ -808,13 +856,23 @@ function cashbook_() {
     sinceStart: { inflow, outflow, profit, charges },
     check: { dashboardTotal: dashTotal, expected, ok: expected === null ? null : Math.round(expected) === Math.round(total) },
     lastRecon,
+    collectors: Object.keys(held).filter(k => Math.round(held[k]) !== 0).map(k => ({ name: label[k], holding: held[k] })).sort((a, b) => b.holding - a.holding),
     entries: cash.sort((a, b) => b.d - a.d).slice(0, 50).map(r => ({ date: fmtDate_(r.d), type: r.Type, from: r.From, to: r.To, amount: num_(r.Amount), note: r.Note, by: r['Entered By'] }))
   };
 }
 
 function addCash_(u, b) {
   const type = String(b.type || '');
-  if (['OPENING', 'TRANSFER', 'BANK_PROFIT', 'BANK_CHARGE'].indexOf(type) < 0) throw new Error('Unknown entry type');
+  if (['OPENING', 'TRANSFER', 'BANK_PROFIT', 'BANK_CHARGE', 'HANDOVER'].indexOf(type) < 0) throw new Error('Unknown entry type');
+  if (type === 'HANDOVER') {
+    const person = String(b.person || '').trim(); if (!person) throw new Error('Who is handing over the cash?');
+    const to = checkAccount_(b.to); const amt = num_(b.amount); if (amt <= 0) throw new Error('Enter an amount');
+    const ref = 'CB-' + Utilities.formatDate(new Date(), tz_(), 'yyMMddHHmmss');
+    // Note keeps "person|note" so collector balances can be worked out
+    sh_(CFG.TABS.CASH).appendRow([toDate_(b.date) || new Date(), 'HANDOVER', moneyAccounts_()[0], to, amt, person + '|' + String(b.note || ''), ref, new Date(), u.UserID]);
+    audit_(u, 'cashbook_handover', { person, to, amt, ref }); markDirty_();
+    return { ref };
+  }
   const amount = num_(b.amount);
   if (type !== 'OPENING' && amount <= 0) throw new Error('Enter an amount');
   const from = type === 'TRANSFER' || type === 'BANK_CHARGE' ? checkAccount_(b.from) : '';
@@ -945,6 +1003,7 @@ function jobDaily() {
   backupFull_('daily');
   const now = new Date();
   if (now.getDay() === 0) backupDrive_();
+  if (now.getDate() === 1) { try { monthlySummarySms_(); } catch (e) { /* ignore */ } }
   const st = getSettings_();
   const month = Utilities.formatDate(now, tz_(), 'yyyy-MM');
   if (String(st.REMINDERS_ON).toUpperCase() === 'YES' && now.getDate() === num_(st.REMINDER_DAY) && props_().getProperty('LAST_REMINDERS') !== month) {
@@ -960,3 +1019,241 @@ function installTriggers() {
 }
 /** Run once to test the Drive backup by hand. */
 function testDriveBackup() { backupDrive_(); Logger.log(props_().getProperty('BACKUP_DRIVE')); }
+
+
+/* =====================================================================
+ * PHASE 3
+ * ===================================================================== */
+
+/* ---------------- admin alerts ---------------- */
+function alert_(text) {
+  const phone = String(getSettings_().ALERT_PHONE || '').trim();
+  if (!phone) return;
+  try { sendSms_('ALERT', phone, (getSettings_().SOMITI_NAME || 'At-Taqwa Somiti') + ' alert: ' + text); } catch (e) { /* never block a save */ }
+}
+
+/* ---------------- void a wrong entry ---------------- */
+/**
+ * Moves the entry rows out of Receive/Expenses into App_Voided (so every Dashboard formula updates by itself)
+ * and keeps a full copy + reason. b: { tab: 'Receive'|'Expenses', receipt } or { tab, row, mid } for old rows without receipt.
+ */
+function voidEntry_(u, b) {
+  const reason = String(b.reason || '').trim(); if (!reason) throw new Error('Reason is required');
+  const tab = b.tab === 'Expenses' ? CFG.TABS.EXP : CFG.TABS.RECEIVE;
+  const width = tab === CFG.TABS.EXP ? 9 : 13;
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error('Another save is running. Try again in a moment.');
+  let out;
+  try {
+    const s = sh_(tab);
+    const last = lastFilledRow_(s, 3);
+    const v = last >= 2 ? s.getRange(2, 1, last - 1, width).getValues() : [];
+    const keyCol = tab === CFG.TABS.EXP ? 6 : 7; // receipt / voucher column (0-based)
+    let rows = [];
+    if (b.receipt) v.forEach((r, i) => { if (String(r[keyCol]).trim() === String(b.receipt).trim()) rows.push(i + 2); });
+    else if (b.row) {
+      const r = v[Number(b.row) - 2];
+      if (!r) throw new Error('Row not found');
+      if (tab === CFG.TABS.RECEIVE && String(r[2]).trim() !== String(b.mid || '').trim()) throw new Error('Row changed since you opened it. Refresh and try again.');
+      if (tab === CFG.TABS.EXP && num_(r[2]) !== num_(b.amount)) throw new Error('Row changed since you opened it. Refresh and try again.');
+      rows = [Number(b.row)];
+    }
+    if (!rows.length) throw new Error('Entry not found');
+    const now = new Date(); let total = 0;
+    const copies = rows.map(rn => { const r = v[rn - 2]; const amt = tab === CFG.TABS.EXP ? num_(r[2]) : num_(r[4]) + num_(r[5]); total += amt;
+      return [now, u.UserID, reason, tab, String(r[keyCol] || ''), tab === CFG.TABS.EXP ? '' : String(r[2]), amt, JSON.stringify(r)]; });
+    const vs = sh_(CFG.TABS.VOID);
+    vs.getRange(vs.getLastRow() + 1, 1, copies.length, VOID_COLS.length).setValues(copies);
+    rows.sort((a, b2) => b2 - a).forEach(rn => s.deleteRow(rn)); // bottom-up so row numbers stay valid
+    SpreadsheetApp.flush();
+    out = { voided: rows.length, total, tab, receipt: b.receipt || '' };
+    audit_(u, 'void', Object.assign({ reason }, out));
+    markDirty_();
+  } finally { lock.releaseLock(); }
+  alert_('VOID by ' + u.UserID + ': ' + out.voided + ' row(s), ' + out.total.toLocaleString('en-US') + ' Tk in ' + out.tab + '. Reason: ' + reason);
+  return out;
+}
+
+/* ---------------- member exit / withdrawal ---------------- */
+function infoStatusCol_() { const t = infoSheet_(); return { t, c: colOf_(t.head, 'Status') }; }
+
+function closePreview_(mid) {
+  const info = readInfo_()[mid]; if (!info) throw new Error('Unknown Member ID');
+  const rows = receiveRows_().filter(r => r.mid === mid);
+  const deposits = rows.reduce((t, r) => t + r.deposit, 0);
+  const others = rowsAsObjects_(CFG.TABS.ACCTS, ACCT_COLS).filter(a => a.HolderUserID === mid && a.MID !== mid).map(a => a.MID);
+  return { mid, name: info.name, months: rows.length, deposits, nominee: info.fields['Nominee Name'] || '', otherAccounts: others, ready: props_().getProperty('DASH_V2') === '1' };
+}
+
+function closeAccount_(u, b) {
+  if (props_().getProperty('DASH_V2') !== '1') throw new Error('Run applyDashboardV2 once first (see setup guide)');
+  const mid = String(b.mid || '').trim();
+  const reason = String(b.reason || '').trim(); if (!reason) throw new Error('Reason is required');
+  const pv = closePreview_(mid);
+  if (pv.otherAccounts.length) throw new Error('This member is Account Holder for ' + pv.otherAccounts.join(', ') + '. Move those accounts first.');
+  if (num_(b.confirmAmount) !== pv.deposits) throw new Error('Amount does not match the deposit total (' + pv.deposits + '). Refresh and try again.');
+  const acct = checkAccount_(b.paidFrom);
+  const paidTo = String(b.paidTo || pv.name).trim();
+  const { t, c } = infoStatusCol_(); if (c < 0) throw new Error('INFORMATION has no Status column. Run applyDashboardV2.');
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error('Another save is running. Try again in a moment.');
+  let voucher = '';
+  try {
+    if (pv.deposits > 0) {
+      const s = sh_(CFG.TABS.EXP); const row = lastFilledRow_(s, 3) + 1;
+      voucher = nextReceipt_().replace(/^[A-Z]+/, 'WDL');
+      s.getRange(row, 1, 1, 9).setValues([[toDate_(b.date) || new Date(), 'Member withdrawal ' + mid + ' (' + pv.name + ')', pv.deposits, 'Paid to: ' + paidTo + '. ' + reason, 'Withdrawal', acct, voucher, new Date(), u.UserID]]);
+      s.getRange(row, 1).setNumberFormat('d-mmm-yyyy');
+    }
+    t.sheet.getRange(readInfo_()[mid].row, c + 1).setValue('Closed');
+    const usr = rowsAsObjects_(CFG.TABS.USERS, USER_COLS).find(x => x.UserID === mid);
+    if (usr) { usr.Status = 'closed'; setCells_(CFG.TABS.USERS, usr._row, USER_COLS, usr); }
+    SpreadsheetApp.flush();
+    audit_(u, 'close_account', { mid, deposits: pv.deposits, voucher, paidTo, acct, reason });
+    markDirty_();
+  } finally { lock.releaseLock(); }
+  alert_('Account CLOSED ' + mid + ' (' + pv.name + '): ' + pv.deposits.toLocaleString('en-US') + ' Tk paid to ' + paidTo + ' from ' + acct + '.');
+  return { mid, paid: pv.deposits, voucher, paidTo };
+}
+
+/**
+ * One-time change so withdrawals and closed members are counted correctly (run from the editor, after approval).
+ * Adds INFORMATION "Status" column; Dashboard: member table skips Closed, deposits minus withdrawals,
+ * "Withdrawal" not counted as a Somiti expense, total check includes withdrawals. Old formulas are saved in App_Audit_Log.
+ */
+function applyDashboardV2() {
+  const ss = ss_(); const d = ss.getSheetByName(CFG.TABS.DASH);
+  const t = infoSheet_();
+  if (colOf_(t.head, 'Status') < 0) t.sheet.getRange(t.headerRow, t.head.filter(h => h).length + 1).setValue('Status').setFontWeight('bold');
+  const t2 = infoSheet_(); const sc = colOf_(t2.head, 'Status') + 1;
+  const colL = c => { let s = ''; while (c > 0) { const m = (c - 1) % 26; s = String.fromCharCode(65 + m) + s; c = Math.floor((c - 1) / 26); } return s; };
+  const S = colL(sc);
+  const first = t2.firstDataRow;
+  const changes = {
+    A22: '=FILTER(INFORMATION!A' + first + ':B,INFORMATION!A' + first + ':A<>"",INFORMATION!A' + first + ':A<>"ATFS-0000",INFORMATION!' + S + first + ':' + S + '<>"Closed")',
+    B3: '=SUMIFS(Receive!E2:E,Receive!C2:C,"<>ATFS-0000")-SUMIFS(Expenses!C2:C,Expenses!E2:E,"Withdrawal")',
+    B5: '=SUMIFS(Expenses!C2:C,Expenses!E2:E,"<>Mosjid",Expenses!E2:E,"<>Withdrawal")',
+    F19: '=IF(SUM(Receive!E2:E)+SUM(Receive!F2:F)=B3+B4+B8+SUMIFS(Expenses!C2:C,Expenses!E2:E,"Withdrawal"),"OK","MISMATCH")'
+  };
+  const old = {}; Object.keys(changes).forEach(a => { old[a] = d.getRange(a).getFormula(); d.getRange(a).setFormula(changes[a]); });
+  audit_(null, 'dashboard_v2', { old, new: changes });
+  props_().setProperty('DASH_V2', '1');
+  Logger.log('Dashboard updated. Old formulas saved in App_Audit_Log.');
+}
+
+/** One-time: lock the old Payment Entry tab (warning only) so nobody enters payments outside the app. */
+function retireOldForm() {
+  const s = ss_().getSheetByName(CFG.TABS.PAYIN); if (!s) { Logger.log('No Payment Entry tab'); return; }
+  const p = s.protect().setDescription('Old form retired: use the At-Taqwa Somiti app');
+  p.setWarningOnly(true);
+  s.getRange('A1').setNote('RETIRED: enter payments in the At-Taqwa Somiti app so they get receipt numbers, audit log and backups.');
+  audit_(null, 'retire_old_form', '');
+  Logger.log('Payment Entry tab now shows a warning before any edit.');
+}
+
+/* ---------------- two-person approval ---------------- */
+function listPending_() {
+  return rowsAsObjects_(CFG.TABS.PENDING, PENDING_COLS).filter(p => p.Status === 'pending')
+    .map(p => Object.assign({ id: p.ID, by: p['Created By'], at: fmtDate_(new Date(p['Created At'])) }, JSON.parse(p.Data || '{}')));
+}
+function decidePending_(u, id, approve, note) {
+  if (!can_(u, 'expenses')) throw new Error('Not allowed');
+  const p = rowsAsObjects_(CFG.TABS.PENDING, PENDING_COLS).find(x => x.ID === id);
+  if (!p || p.Status !== 'pending') throw new Error('Already decided or not found');
+  if (p['Created By'] === u.UserID) throw new Error('A different person must approve this');
+  let res = null;
+  if (approve) res = writeExpense_({ UserID: p['Created By'] }, JSON.parse(p.Data), u.UserID);
+  p.Status = approve ? 'approved' : 'rejected'; p['Decided By'] = u.UserID; p['Decided At'] = new Date(); p.Note = String(note || '') + (res ? ' ' + res.voucher : '');
+  setCells_(CFG.TABS.PENDING, p._row, PENDING_COLS, p);
+  audit_(u, approve ? 'approve_expense' : 'reject_expense', { id });
+  return { id, status: p.Status, voucher: res ? res.voucher : '' };
+}
+
+/* ---------------- monthly report ---------------- */
+function monthReport_(ym) {
+  const m = String(ym || '').match(/^(\d{4})-(\d{2})$/);
+  const now = new Date();
+  const y = m ? +m[1] : now.getFullYear(), mo = m ? +m[2] - 1 : now.getMonth();
+  const from = new Date(y, mo, 1), to = new Date(y, mo + 1, 1);
+  const inM = d => d && d >= from && d < to;
+  const col = { deposits: 0, serviceCharge: 0, mosjid: 0, byAccount: {}, count: 0 };
+  receiveRows_().forEach(r => { if (!inM(r.date)) return; col.count++;
+    if (r.mid === CFG.MOSJID_ID) col.mosjid += r.deposit; else { col.deposits += r.deposit; col.serviceCharge += r.sc; }
+    const a = r.account || 'not recorded'; col.byAccount[a] = (col.byAccount[a] || 0) + r.deposit + r.sc; });
+  const exp = { Somiti: 0, Mosjid: 0, Withdrawal: 0, rows: [] };
+  expenseRows_().forEach(e => { if (!inM(e.date)) return; const f = e.fund; exp[f] = (exp[f] || 0) + e.amount; exp.rows.push({ date: fmtDate_(e.date), purpose: e.purpose, amount: e.amount, fund: f }); });
+  const newMembers = rowsAsObjects_(CFG.TABS.ACCTS, ACCT_COLS).filter(a => inM(toDate_(a.LinkedAt) || (a.LinkedAt instanceof Date ? a.LinkedAt : null)) && /^new/.test(a.Reason)).map(a => a.MID + ' ' + a.AccountName);
+  const voided = rowsAsObjects_(CFG.TABS.VOID, VOID_COLS).filter(v => inM(v['Voided At'] instanceof Date ? v['Voided At'] : toDate_(v['Voided At']))).length;
+  const lim = num_(getSettings_().INACTIVE_AFTER_MONTHS) || 6;
+  const dash = readDashboard_();
+  const due = dash.members.filter(x => dueMonths_(x.status) > 0).map(x => ({ mid: x.mid, name: x.name, due: dueMonths_(x.status), inactive: dueMonths_(x.status) >= lim }));
+  let cb = null; try { cb = cashbook_(); } catch (e) { cb = null; }
+  return { month: Utilities.formatDate(from, tz_(), 'MMMM yyyy'), collections: col, expenses: exp, newMembers, voided, due, dashboard: dash.left.concat(dash.right), balances: cb && cb.started ? cb.balances : null, collectors: cb && cb.started ? cb.collectors : [] };
+}
+
+/* ---------------- helpers for forms ---------------- */
+function collectorNames_() {
+  const c = {}; receiveRows_().forEach(r => { const n = r.collectedBy.trim(); if (n) c[n] = (c[n] || 0) + 1; });
+  return Object.keys(c).sort((a, b) => c[b] - c[a]).slice(0, 30);
+}
+function setUserPhone_(admin, userId, phone) {
+  const u = rowsAsObjects_(CFG.TABS.USERS, USER_COLS).find(x => x.UserID === userId); if (!u) throw new Error('Unknown user');
+  if (/^ATFS-/.test(userId)) return updateMember_(admin, userId, { phone });
+  u.Phone = String(phone || '').trim(); setCells_(CFG.TABS.USERS, u._row, USER_COLS, u);
+  audit_(admin, 'set_phone', { userId }); return true;
+}
+
+/* ---------------- documents (Google Drive) ---------------- */
+function docsFolder_(mid) {
+  let id = props_().getProperty('DOCS_FOLDER'); let root = null;
+  try { root = id ? DriveApp.getFolderById(id) : null; } catch (e) { root = null; }
+  if (!root) { root = DriveApp.createFolder('At-Taqwa Somiti Documents'); props_().setProperty('DOCS_FOLDER', root.getId()); }
+  const it = root.getFoldersByName(mid); return it.hasNext() ? it.next() : root.createFolder(mid);
+}
+function uploadDoc_(u, b) {
+  const mid = String(b.mid || ''); if (!readInfo_()[mid]) throw new Error('Unknown Member ID');
+  const type = ['Photo', 'NID front', 'NID back', 'Nominee NID', 'Nominee photo', 'Form', 'Other'].indexOf(b.type) >= 0 ? b.type : 'Other';
+  const m = String(b.dataUrl || '').match(/^data:([\w/+.-]+);base64,(.+)$/); if (!m) throw new Error('Bad file');
+  if (m[2].length > 4 * 1024 * 1024) throw new Error('File too big (max ~3 MB)');
+  const ext = m[1] === 'application/pdf' ? 'pdf' : 'jpg';
+  const name = mid + ' ' + type + ' ' + Utilities.formatDate(new Date(), tz_(), 'yyyy-MM-dd HHmm') + '.' + ext;
+  const file = docsFolder_(mid).createFile(Utilities.newBlob(Utilities.base64Decode(m[2]), m[1], name));
+  sh_(CFG.TABS.DOCS).appendRow([mid, type, file.getId(), name, new Date(), u.UserID]);
+  audit_(u, 'upload_doc', { mid, type, name }); markDirty_();
+  return { fileId: file.getId(), name };
+}
+function listDocs_(u, mid) {
+  if (!canSee_(u, mid)) throw new Error('Not allowed');
+  return rowsAsObjects_(CFG.TABS.DOCS, DOC_COLS).filter(d => d.MID === mid).map(d => ({ type: d.Type, fileId: d['File ID'], name: d['File Name'], at: fmtDate_(new Date(d['Uploaded At'])) }));
+}
+function getDoc_(u, fileId) {
+  const d = rowsAsObjects_(CFG.TABS.DOCS, DOC_COLS).find(x => x['File ID'] === fileId); if (!d) throw new Error('Not found');
+  if (!canSee_(u, d.MID)) throw new Error('Not allowed');
+  const blob = DriveApp.getFileById(fileId).getBlob();
+  return { name: d['File Name'], dataUrl: 'data:' + blob.getContentType() + ';base64,' + Utilities.base64Encode(blob.getBytes()) };
+}
+
+/* ---------------- data check ---------------- */
+function dataHealth_() {
+  const info = readInfo_(); const issues = [];
+  const users = rowsAsObjects_(CFG.TABS.USERS, USER_COLS);
+  Object.keys(info).forEach(mid => {
+    if (mid === CFG.MOSJID_ID) return; const i = info[mid]; const f = i.fields;
+    if (String(f.Status || '') === 'Closed') return;
+    if (!i.phone) issues.push({ mid, name: i.name, issue: 'No mobile number' });
+    else if (!normPhone_(i.phone) && !waNumber_(i.phone)) issues.push({ mid, name: i.name, issue: 'Mobile is not a phone number: "' + i.phone + '"' });
+    if (!String(f['Nominee Name'] || '').trim()) issues.push({ mid, name: i.name, issue: 'No nominee' });
+    if (f.NID !== undefined && !String(f.NID || '').trim()) issues.push({ mid, name: i.name, issue: 'No NID' });
+  });
+  users.filter(x => x.Role !== 'member' && x.Status === 'active' && !String(x.Phone || '').trim()).forEach(x => issues.push({ mid: x.UserID, name: x.Name, issue: 'Staff login has no mobile number' }));
+  if (!String(getSettings_().ALERT_PHONE || '').trim()) issues.push({ mid: 'Settings', name: 'App_Settings', issue: 'ALERT_PHONE is empty: no admin alerts will be sent' });
+  return issues;
+}
+
+/* monthly summary SMS on the 1st (called from jobDaily) */
+function monthlySummarySms_() {
+  const prev = new Date(); prev.setDate(0);
+  const r = monthReport_(Utilities.formatDate(prev, tz_(), 'yyyy-MM'));
+  const c = r.collections, e = r.expenses;
+  alert_(r.month + ': collected ' + (c.deposits + c.serviceCharge + c.mosjid).toLocaleString('en-US') + ' Tk, expenses ' + (e.Somiti + e.Mosjid).toLocaleString('en-US') + ' Tk, ' + r.due.length + ' members due. Full report in the app: More > Monthly report.');
+}
