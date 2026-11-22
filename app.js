@@ -48,6 +48,34 @@
     return '<span class="chip ' + cls + '">' + esc(s || '-') + '</span>';
   }
 
+  /* ---------- receipt image (share on WhatsApp) ---------- */
+  async function shareReceipt(r) {
+    const c = document.createElement('canvas'); c.width = 720; c.height = 900; const g = c.getContext('2d');
+    g.fillStyle = '#ffffff'; g.fillRect(0, 0, 720, 900);
+    g.fillStyle = '#0f5b46'; g.fillRect(0, 0, 720, 150);
+    g.fillStyle = '#ffffff'; g.font = 'bold 42px system-ui, sans-serif'; g.fillText('At-Taqwa Somiti', 40, 75);
+    g.font = '26px system-ui, sans-serif'; g.fillText('Payment Receipt', 40, 118);
+    let y = 210;
+    const line = (k, v, big) => { g.font = '24px system-ui, sans-serif'; g.fillStyle = '#68736e'; g.fillText(k, 40, y); g.fillStyle = big ? '#0f5b46' : '#1d2421'; g.font = (big ? 'bold 40px' : 'bold 28px') + ' system-ui, sans-serif'; g.fillText(String(v || '-').slice(0, 44), 40, y + (big ? 46 : 36)); y += big ? 96 : 80; };
+    line('Receipt No', r.receipt); line('Member', r.member); line('For', r.forText); line('Deposit date', r.date); if (r.collectedBy) line('Collected by', r.collectedBy);
+    line('Amount', tk(r.amount) + ' Tk', true);
+    g.fillStyle = '#e3e8e5'; g.fillRect(40, 840, 640, 2); g.fillStyle = '#68736e'; g.font = '20px system-ui, sans-serif'; g.fillText('At-Taqwa Somiti app · ' + new Date().toLocaleString(), 40, 875);
+    const blob = await new Promise((ok) => c.toBlob(ok, 'image/png'));
+    const file = new File([blob], (r.receipt || 'receipt') + '.png', { type: 'image/png' });
+    try {
+      if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: 'Receipt ' + (r.receipt || '') }); return; }
+    } catch (e) { if (e.name === 'AbortError') return; }
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = file.name; a.click();
+  }
+  async function voidFlow(payload, what, after) {
+    const reason = (prompt('VOID ' + what + '\nThis removes it from the totals (a copy is kept in App_Voided).\n\nReason (required):') || '').trim();
+    if (!reason) return;
+    try { const r = await api('voidEntry', Object.assign({ reason }, payload)); toast('Voided ' + r.voided + ' row(s), ' + tk(r.total) + ' Tk'); state.accounts = null; after && after(); }
+    catch (e) { toast(e.message, 5000); }
+  }
+  let collectorCache = null;
+  async function collectorList() { if (!collectorCache) { try { collectorCache = await api('collectorNames'); } catch (e) { collectorCache = []; } } return collectorCache; }
+
   /* ---------- nav ---------- */
   function navItems() {
     if (!state.user) return [];
@@ -70,7 +98,8 @@
   const routes = {
     login: viewLogin, dashboard: viewDashboard, accounts: viewAccounts, ledger: viewLedger,
     pay: viewPay, tx: viewTx, more: viewMore, users: viewUsers,
-    member: viewMemberForm, profile: viewProfile, expenses: viewExpenses, cash: viewCash, reminders: viewReminders, backups: viewBackups
+    member: viewMemberForm, profile: viewProfile, expenses: viewExpenses, cash: viewCash, reminders: viewReminders, backups: viewBackups,
+    report: viewReport, health: viewHealth, close: viewClose
   };
   function go() {
     const parts = (location.hash || '').replace(/^#\//, '').split('/');
@@ -177,8 +206,21 @@
         (L.mid !== 'ATFS-0000' ? '<a class="btn sec" href="#/profile/' + esc(L.mid) + '">👤 Member profile</a>' : '') +
         (L.donations && L.donations.length ? '<h3>Mosjid Fund donations (' + tk(L.donations.reduce((t, d) => t + d.amount, 0)) + ' Tk)</h3><div class="card">' + L.donations.map((d) => '<div class="ent"><div><b>' + esc(d.date) + '</b><div class="muted">' + esc(d.receipt) + '</div></div><div class="amt">' + tk(d.amount) + '</div></div>').join('') + '</div>' : '') +
         '<h3>History (' + L.entries.length + ')</h3><div class="card">' +
-        (L.entries.map((e) => '<div class="ent"><div><b>' + esc(e.forMonth) + '</b><div class="muted">Paid ' + esc(e.date) + (e.receipt ? ' · ' + esc(e.receipt) : '') + (e.remarks ? ' · ' + esc(e.remarks) : '') + '</div></div><div class="amt">' + tk(e.deposit) + (e.sc ? '<div class="muted">+' + tk(e.sc) + ' SC</div>' : '') + '</div></div>').join('') || '<div class="muted">No entries yet</div>') + '</div>';
+        (L.entries.map((e, i) => '<div class="ent"><div><b>' + esc(e.forMonth) + '</b><div class="muted">Paid ' + esc(e.date) + (e.receipt ? ' · ' + esc(e.receipt) : '') + (e.remarks ? ' · ' + esc(e.remarks) : '') + '</div>' +
+          '<div class="row" style="margin-top:4px;gap:6px">' + (e.receipt ? '<button class="btn sm sec" data-share="' + i + '">🧾 Receipt</button>' : '') + (state.user.role === 'admin' ? '<button class="btn sm sec" data-void="' + i + '" style="color:var(--red)">Void</button>' : '') + '</div></div>' +
+          '<div class="amt">' + tk(e.deposit) + (e.sc ? '<div class="muted">+' + tk(e.sc) + ' SC</div>' : '') + '</div></div>').join('') || '<div class="muted">No entries yet</div>') + '</div>' +
+        (state.user.role === 'admin' && L.mid !== 'ATFS-0000' && s.mid ? '<a class="btn sec" style="color:var(--red)" href="#/close/' + esc(L.mid) + '">Close account / withdrawal</a>' : '');
       $('#pdf').onclick = () => statementPdf(L);
+      view.querySelectorAll('[data-share]').forEach((b) => b.onclick = () => {
+        const e = L.entries[+b.dataset.share]; const same = L.entries.filter((x) => x.receipt === e.receipt);
+        shareReceipt({ receipt: e.receipt, member: L.mid + ' · ' + L.name, forText: same.length > 1 ? same[same.length - 1].forMonth + ' to ' + same[0].forMonth + ' (' + same.length + ' months)' : e.forMonth, date: e.date, collectedBy: e.collectedBy, amount: same.reduce((t, x) => t + x.deposit + x.sc, 0) });
+      });
+      view.querySelectorAll('[data-void]').forEach((b) => b.onclick = () => {
+        const e = L.entries[+b.dataset.void];
+        const payload = e.receipt ? { tab: 'Receive', receipt: e.receipt } : { tab: 'Receive', row: e.row, mid: L.mid };
+        const n = e.receipt ? L.entries.filter((x) => x.receipt === e.receipt).length : 1;
+        voidFlow(payload, e.receipt ? 'receipt ' + e.receipt + ' (' + n + ' month' + (n > 1 ? 's' : '') + ')' : e.forMonth + ' entry', () => viewLedger([L.mid]));
+      });
     } catch (e) { fail(e); }
   }
 
@@ -215,7 +257,7 @@
     const mode = args[0] === 'mosjid' ? 'mosjid' : 'member';
     const opts = list.map((a) => '<option value="' + esc(a.mid) + '">' + esc(a.mid + ' · ' + a.name) + '</option>').join('');
     const common = '<label>Deposit date</label><input id="dd" type="date" value="' + today() + '">' +
-      '<label>Collected by</label><input id="cb" placeholder="Who received the money">' +
+      '<label>Collected by</label><input id="cb" list="cbl" placeholder="Who received the money"><datalist id="cbl"></datalist>' +
       '<label>Received into</label><select id="acct">' + moneyOpts(money) + '</select>';
     view.innerHTML = '<h2>New Payment</h2><div class="tabs"><button class="' + (mode === 'member' ? 'on' : '') + '" onclick="location.hash=\'#/pay\'">Member deposit</button><button class="' + (mode === 'mosjid' ? 'on' : '') + '" onclick="location.hash=\'#/pay/mosjid\'">🕌 Mosjid Fund</button></div>' +
       '<div class="card">' + (mode === 'member'
@@ -227,6 +269,7 @@
       '<div id="pv"></div><div id="perr" class="err"></div>' +
       '<button class="btn" id="go">' + (mode === 'member' ? 'Preview' : 'Save donation') + '</button></div>';
 
+    collectorList().then((l) => { const d = $('#cbl'); if (d) d.innerHTML = l.map((n) => '<option value="' + esc(n) + '">').join(''); });
     if (mode === 'mosjid') {
       const donorRow = () => {
         const d = document.createElement('div'); d.className = 'row'; d.style.marginTop = '8px';
@@ -248,7 +291,8 @@
         b.disabled = true; b.textContent = 'Saving…';
         try {
           const r = await api('addMosjid', { donors, depositDate: $('#dd').value, collectedBy: $('#cb').value, account: $('#acct').value });
-          view.innerHTML = '<div class="card"><h2>✅ Saved</h2><div class="kv"><span class="l">Receipt</span><span class="v">' + esc(r.receipt) + '</span></div><div class="kv"><span class="l">Total</span><span class="v">' + tk(r.amount) + ' Tk</span></div><div class="kv"><span class="l">Donors</span><span class="v">' + esc(r.donors) + '</span></div><a class="btn sec" href="#/pay/mosjid" onclick="setTimeout(()=>location.reload(),50)">New entry</a></div>';
+          view.innerHTML = '<div class="card"><h2>✅ Saved</h2><div class="kv"><span class="l">Receipt</span><span class="v">' + esc(r.receipt) + '</span></div><div class="kv"><span class="l">Total</span><span class="v">' + tk(r.amount) + ' Tk</span></div><div class="kv"><span class="l">Donors</span><span class="v">' + esc(r.donors) + '</span></div><button class="btn sec" id="shr">🧾 Share receipt image</button><a class="btn sec" href="#/pay/mosjid" onclick="setTimeout(()=>location.reload(),50)">New entry</a></div>';
+          $('#shr').onclick = () => shareReceipt({ receipt: r.receipt, member: 'Mosjid Fund donation', forText: r.donors, date: new Date().toDateString(), amount: r.amount });
         } catch (e) { $('#perr').textContent = e.message; b.disabled = false; b.textContent = 'Save donation'; }
       };
       return;
@@ -274,12 +318,14 @@
           b.textContent = 'Confirm & save'; b.disabled = false;
         } else {
           b.textContent = 'Saving…';
+          const cbIn = $('#cb').value;
           const r = await api('addPayment', { mid, count: pv.months.length, expectFirst: pv.months[0], depositDate: $('#dd').value, collectedBy: $('#cb').value, remarks: $('#rm').value, account: $('#acct').value });
           state.accounts = null;
           view.innerHTML = '<div class="card"><h2>✅ Saved</h2><div class="kv"><span class="l">Receipt</span><span class="v">' + esc(r.receipt) + '</span></div><div class="kv"><span class="l">Member</span><span class="v">' + esc(r.mid + ' · ' + r.name) + '</span></div><div class="kv"><span class="l">Months</span><span class="v">' + esc(r.months.join(', ')) + '</span></div><div class="kv"><span class="l">Total</span><span class="v">' + tk(r.total) + ' Tk</span></div>' +
             (r.sms && !r.waOnly ? '<div class="kv"><span class="l">SMS</span><span class="v muted">' + esc(r.sms) + '</span></div>' : '') +
             (r.wa ? '<a class="btn ' + (r.waOnly ? '' : 'sec') + '" style="background:' + (r.waOnly ? '#25D366' : '') + '" href="' + esc(r.wa) + '" target="_blank" rel="noopener">💬 Send on WhatsApp' + (r.waOnly ? ' (no SMS for this number)' : '') + '</a>' : '') +
-            '<a class="btn" href="#/ledger/' + esc(r.mid) + '">View ledger</a><a class="btn sec" href="#/pay" onclick="setTimeout(()=>location.reload(),50)">New payment</a></div>';
+            '<button class="btn sec" id="shr">🧾 Share receipt image</button><a class="btn" href="#/ledger/' + esc(r.mid) + '">View ledger</a><a class="btn sec" href="#/pay" onclick="setTimeout(()=>location.reload(),50)">New payment</a></div>';
+          const cbv = cbIn; $('#shr').onclick = () => shareReceipt({ receipt: r.receipt, member: r.mid + ' · ' + r.name, forText: r.months.length > 1 ? r.months[0] + ' to ' + r.months[r.months.length - 1] + ' (' + r.months.length + ' months)' : r.months[0], date: new Date().toDateString(), collectedBy: cbv, amount: r.total });
         }
       } catch (e) { $('#perr').textContent = e.message; b.disabled = false; b.textContent = pv ? 'Confirm & save' : 'Preview'; }
     };
@@ -289,8 +335,13 @@
     busy();
     try {
       const t = await api('transactions', { limit: 100 });
-      view.innerHTML = '<h2>Recent activity</h2><div class="card">' + t.map((e) =>
-        '<div class="ent"><div><b>' + esc(e.name) + '</b> <span class="muted">' + esc(e.mid) + '</span><div class="muted">' + esc(e.date) + ' · for ' + esc(e.forMonth) + (e.receipt ? ' · ' + esc(e.receipt) : '') + (e.collectedBy ? ' · by ' + esc(e.collectedBy) : '') + (e.remarks ? ' · ' + esc(e.remarks) : '') + '</div></div><div class="amt">' + tk(e.deposit) + '</div></div>').join('') + '</div>';
+      view.innerHTML = '<h2>Recent activity</h2><div class="card">' + t.map((e, i) =>
+        '<div class="ent"><div><b>' + esc(e.name) + '</b> <span class="muted">' + esc(e.mid) + '</span><div class="muted">' + esc(e.date) + ' · for ' + esc(e.forMonth) + (e.receipt ? ' · ' + esc(e.receipt) : '') + (e.collectedBy ? ' · by ' + esc(e.collectedBy) : '') + (e.remarks ? ' · ' + esc(e.remarks) : '') + '</div>' +
+        (state.user.role === 'admin' ? '<button class="btn sm sec" data-void="' + i + '" style="color:var(--red);margin-top:4px">Void</button>' : '') + '</div><div class="amt">' + tk(e.deposit) + '</div></div>').join('') + '</div>';
+      view.querySelectorAll('[data-void]').forEach((b) => b.onclick = () => {
+        const e = t[+b.dataset.void];
+        voidFlow(e.receipt ? { tab: 'Receive', receipt: e.receipt } : { tab: 'Receive', row: e.row, mid: e.mid }, (e.receipt ? 'receipt ' + e.receipt : e.mid + ' ' + e.forMonth) + ' (' + e.name + ')', viewTx);
+      });
     } catch (e) { fail(e); }
   }
 
@@ -300,7 +351,8 @@
     if (admin) links.push(['#/member', '➕ Add member'], ['#/users', '👤 Users & account linking']);
     if (can('expenses')) links.push(['#/expenses', '💸 Expenses']);
     if (isStaff()) links.push(['#/cash', '🏦 Cash book (Cash / Bank / bKash)']);
-    if (admin) links.push(['#/reminders', '🔔 Due reminders'], ['#/backups', '🗄️ Backups']);
+    if (isStaff()) links.push(['#/report', '📄 Monthly report']);
+    if (admin) links.push(['#/reminders', '🔔 Due reminders'], ['#/health', '🩺 Data check'], ['#/backups', '🗄️ Backups']);
     view.innerHTML = '<h2>' + (isStaff() ? 'More' : 'Settings') + '</h2>' + (links.length ? '<div class="card list">' + links.map(([h, l]) => '<a class="item" href="' + h + '" style="color:inherit;text-decoration:none"><span class="t">' + l + '</span><span class="muted">›</span></a>').join('') + '</div>' : '') +
       '<div class="card" style="margin-top:16px"><b>Change PIN</b><label>Current PIN</label><input id="op" type="password" inputmode="numeric" maxlength="6"><label>New PIN (4 to 6 digits)</label><input id="np" type="password" inputmode="numeric" maxlength="6"><button class="btn" id="cp">Change PIN</button><div id="cerr" class="err"></div></div>' +
       '<button class="btn sec" id="lo">Log out</button>' +
@@ -355,26 +407,73 @@
         (p.holder && p.holder !== mid ? '<div class="kv"><span class="l">Account Holder</span><span class="v">' + esc(p.holder) + '</span></div>' : '') +
         Object.keys(p.fields).filter((k) => k !== 'name').map((k) => '<div class="kv"><span class="l">' + esc((label[k] || k).replace(' *', '').replace(/\s*\(.*\)/, '')) + '</span><span class="v">' + (esc(p.fields[k]) || '<span class="muted">—</span>') + '</span></div>').join('') + '</div>' +
         (!p.fields.nominee ? '<div class="card" style="background:var(--redbg)">⚠️ No nominee recorded. Every member should have a nominee.</div>' : '') +
-        (state.user.role === 'admin' ? '<a class="btn sec" href="#/member/' + esc(mid) + '">✏️ Edit profile</a>' : '');
+        (state.user.role === 'admin' ? '<a class="btn sec" href="#/member/' + esc(mid) + '">✏️ Edit profile</a>' : '') +
+        '<h3>Documents</h3><div class="card" id="docs"><div class="muted">Loading…</div></div>' +
+        (state.user.role === 'admin' ? '<div class="card"><b>Upload document</b><label>Type</label><select id="dtype"><option>Photo</option><option>NID front</option><option>NID back</option><option>Nominee NID</option><option>Nominee photo</option><option>Form</option><option>Other</option></select><label>File (photo or PDF)</label><input id="dfile" type="file" accept="image/*,application/pdf"><button class="btn" id="dup">Upload</button><div id="derr" class="err"></div></div>' : '');
+      const loadDocs = async () => {
+        const d = await api('docs', { mid });
+        $('#docs').innerHTML = d.length ? d.map((x) => '<div class="ent"><div><b>' + esc(x.type) + '</b><div class="muted">' + esc(x.at) + '</div></div><button class="btn sm sec" data-doc="' + esc(x.fileId) + '">View</button></div>').join('') : '<div class="muted">No documents yet</div>';
+        $('#docs').querySelectorAll('[data-doc]').forEach((b) => b.onclick = async () => {
+          b.textContent = '…';
+          try {
+            const f = await api('doc', { fileId: b.dataset.doc });
+            const bin = atob(f.dataUrl.split(',')[1]); const arr = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+            const url = URL.createObjectURL(new Blob([arr], { type: f.dataUrl.slice(5, f.dataUrl.indexOf(';')) }));
+            window.open(url, '_blank');
+          } catch (e) { toast(e.message); }
+          b.textContent = 'View';
+        });
+      };
+      loadDocs().catch((e) => { $('#docs').innerHTML = '<div class="err">' + esc(e.message) + '</div>'; });
+      if ($('#dup')) $('#dup').onclick = async () => {
+        const f = $('#dfile').files[0]; if (!f) { $('#derr').textContent = 'Choose a file'; return; }
+        const b = $('#dup'); b.disabled = true; b.textContent = 'Uploading…';
+        try { const dataUrl = await shrink(f); await api('uploadDoc', { mid, type: $('#dtype').value, dataUrl }); toast('Uploaded'); $('#dfile').value = ''; await loadDocs(); }
+        catch (e) { $('#derr').textContent = e.message; }
+        b.disabled = false; b.textContent = 'Upload';
+      };
     } catch (e) { fail(e); }
+  }
+
+  /** Photos are resized to max 1600px JPEG so uploads stay small; PDFs go as-is. */
+  function shrink(file) {
+    return new Promise((ok, no) => {
+      const rd = new FileReader();
+      rd.onerror = () => no(new Error('Could not read file'));
+      rd.onload = () => {
+        if (file.type === 'application/pdf') { if (rd.result.length > 4e6) return no(new Error('PDF too big (max ~3 MB)')); return ok(rd.result); }
+        const img = new Image();
+        img.onload = () => { const k = Math.min(1, 1600 / Math.max(img.width, img.height)); const c = document.createElement('canvas'); c.width = Math.round(img.width * k); c.height = Math.round(img.height * k); c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); ok(c.toDataURL('image/jpeg', 0.82)); };
+        img.onerror = () => no(new Error('Not an image'));
+        img.src = rd.result;
+      };
+      rd.readAsDataURL(file);
+    });
   }
 
   async function viewExpenses() {
     if (!can('expenses') && !isStaff()) { location.hash = '#/more'; return; }
     busy();
     try {
-      const [d, money] = await Promise.all([api('expenses', { limit: 100 }), moneyAccounts()]);
-      view.innerHTML = '<a href="#/more" class="muted">← More</a><h2>Expenses</h2><div class="grid"><div class="stat"><div class="l">Somiti expenses</div><div class="v">' + tk(d.totals.Somiti) + ' Tk</div></div><div class="stat"><div class="l">Mosjid expenses</div><div class="v">' + tk(d.totals.Mosjid) + ' Tk</div></div></div>' +
+      const [d, money, pend] = await Promise.all([api('expenses', { limit: 100 }), moneyAccounts(), api('pending').catch(() => [])]);
+      view.innerHTML = '<a href="#/more" class="muted">← More</a><h2>Expenses</h2><div class="grid"><div class="stat"><div class="l">Somiti expenses</div><div class="v">' + tk(d.totals.Somiti) + ' Tk</div></div><div class="stat"><div class="l">Mosjid expenses</div><div class="v">' + tk(d.totals.Mosjid) + ' Tk</div></div>' + (d.totals.Withdrawal ? '<div class="stat"><div class="l">Member withdrawals</div><div class="v">' + tk(d.totals.Withdrawal) + ' Tk</div></div>' : '') + '</div>' +
+        (pend.length ? '<h3>Waiting for approval (' + pend.length + ')</h3><div class="card">' + pend.map((p) => '<div class="ent"><div><b>' + esc(p.purpose) + '</b> <span class="chip">' + esc(p.fund) + '</span><div class="muted">' + esc(p.date) + ' · by ' + esc(p.by) + ' · from ' + esc(p.paidFrom) + '</div>' + (can('expenses') && p.by !== state.user.id ? '<div class="row" style="gap:6px;margin-top:4px"><button class="btn sm" data-ok="' + esc(p.id) + '">Approve</button><button class="btn sm sec" data-no="' + esc(p.id) + '">Reject</button></div>' : '<div class="muted">Needs a different person to approve</div>') + '</div><div class="amt">' + tk(p.amount) + '</div></div>').join('') + '</div>' : '') +
         (can('expenses') ? '<h3>New expense</h3><div class="card"><label>Fund</label><div class="tabs"><button class="on" data-fund="Somiti">Somiti</button><button data-fund="Mosjid">🕌 Mosjid</button></div>' +
           '<label>Purpose</label><input id="ep" placeholder="e.g. Bank charge, printing forms"><label>Amount (Tk)</label><input id="ea" type="number" inputmode="numeric"><label>Date</label><input id="ed" type="date" value="' + today() + '"><label>Paid from</label><select id="ef">' + moneyOpts(money) + '</select><label>Remarks (optional)</label><input id="er">' +
           '<button class="btn" id="esave">Save expense</button><div id="eerr" class="err"></div></div>' : '') +
-        '<h3>Recent</h3><div class="card">' + (d.rows.map((e) => '<div class="ent"><div><b>' + esc(e.purpose) + '</b> <span class="chip">' + esc(e.fund) + '</span><div class="muted">' + esc(e.date) + (e.paidFrom ? ' · from ' + esc(e.paidFrom) : '') + (e.voucher ? ' · ' + esc(e.voucher) : '') + (e.remarks ? ' · ' + esc(e.remarks) : '') + '</div></div><div class="amt">' + tk(e.amount) + '</div></div>').join('') || '<div class="muted">No expenses yet</div>') + '</div>';
+        '<h3>Recent</h3><div class="card">' + (d.rows.map((e) => '<div class="ent"><div><b>' + esc(e.purpose) + '</b> <span class="chip">' + esc(e.fund) + '</span><div class="muted">' + esc(e.date) + (e.paidFrom ? ' · from ' + esc(e.paidFrom) : '') + (e.voucher ? ' · ' + esc(e.voucher) : '') + (e.remarks ? ' · ' + esc(e.remarks) : '') + '</div>' + (state.user.role === 'admin' && e.fund !== 'Withdrawal' ? '<button class="btn sm sec" data-ev="' + esc(e.row) + '|' + esc(e.amount) + '|' + esc(e.voucher) + '" style="color:var(--red);margin-top:4px">Void</button>' : '') + '</div><div class="amt">' + tk(e.amount) + '</div></div>').join('') || '<div class="muted">No expenses yet</div>') + '</div>';
+      view.querySelectorAll('[data-ev]').forEach((b) => b.onclick = () => { const [row, amount, voucher] = b.dataset.ev.split('|'); voidFlow(voucher ? { tab: 'Expenses', receipt: voucher } : { tab: 'Expenses', row: +row, amount: +amount }, 'expense ' + (voucher || '') + ' (' + tk(amount) + ' Tk)', viewExpenses); });
+      view.querySelectorAll('[data-ok],[data-no]').forEach((b) => b.onclick = async () => {
+        const ok = !!b.dataset.ok; const id = b.dataset.ok || b.dataset.no;
+        if (!confirm((ok ? 'Approve' : 'Reject') + ' this expense?')) return;
+        try { const r = await api('decide', { id, approve: ok }); toast(ok ? 'Approved ' + r.voucher : 'Rejected'); viewExpenses(); } catch (e) { toast(e.message); }
+      });
       let fund = 'Somiti';
       view.querySelectorAll('[data-fund]').forEach((b) => b.onclick = () => { fund = b.dataset.fund; view.querySelectorAll('[data-fund]').forEach((x) => x.classList.toggle('on', x === b)); });
       if ($('#esave')) $('#esave').onclick = async () => {
         const amt = Number($('#ea').value || 0);
         if (!confirm('Save ' + tk(amt) + ' Tk expense from the ' + fund + ' fund?')) return;
-        try { const r = await api('addExpense', { fund, purpose: $('#ep').value, amount: amt, date: $('#ed').value, paidFrom: $('#ef').value, remarks: $('#er').value }); toast('Saved ' + r.voucher); viewExpenses(); }
+        try { const r = await api('addExpense', { fund, purpose: $('#ep').value, amount: amt, date: $('#ed').value, paidFrom: $('#ef').value, remarks: $('#er').value }); if (r.pending) alert('Saved for approval. This is a big amount, so a different admin or management member must approve it before it counts.'); else toast('Saved ' + r.voucher); viewExpenses(); }
         catch (e) { $('#eerr').textContent = e.message; }
       };
     } catch (e) { fail(e); }
@@ -402,13 +501,14 @@
         '<div class="grid" style="margin-top:10px">' + Object.keys(c.balances).map((a) => '<div class="stat"><div class="l">' + esc(a) + '</div><div class="v">' + tk(c.balances[a]) + ' Tk</div>' + (c.lastRecon[a] ? '<div class="muted">Checked ' + esc(c.lastRecon[a].date) + (c.lastRecon[a].diff ? ' · <span style="color:var(--red)">diff ' + tk(c.lastRecon[a].diff) + '</span>' : ' · ✓') + '</div>' : '') + '</div>').join('') +
         '<div class="stat"><div class="l">Total</div><div class="v">' + tk(c.total) + ' Tk</div></div></div>' +
         '<div class="card" style="margin-top:12px;background:' + (ck.ok ? 'var(--grnbg)' : 'var(--redbg)') + '">' + (ck.ok ? '✅ Matches the Dashboard total' + (c.sinceStart.profit || c.sinceStart.charges ? ' (+ bank profit − charges)' : '') : '⚠️ Does not match the Dashboard: app ' + tk(c.total) + ' vs expected ' + tk(ck.expected) + '. Check opening balances or missing entries.') + '</div>' +
-        (admin ? '<h3>New entry</h3><div class="card"><div class="tabs"><button class="on" data-t="TRANSFER">Transfer</button><button data-t="BANK_PROFIT">Bank profit</button><button data-t="BANK_CHARGE">Bank charge</button><button data-t="RECON">Check balance</button></div><div id="cf"></div><button class="btn" id="csave">Save</button><div id="cerr" class="err"></div></div>' : '') +
+        (c.collectors && c.collectors.length ? '<h3>Cash held by collectors</h3><div class="card">' + c.collectors.map((x) => '<div class="kv"><span class="l">' + esc(x.name) + '</span><span class="v">' + tk(x.holding) + ' Tk</span></div>').join('') + '<div class="muted">Cash they received (into Cash) minus what they handed over.</div></div>' : '') +
+        (admin ? '<h3>New entry</h3><div class="card"><div class="tabs" style="flex-wrap:wrap"><button data-t="HANDOVER">Handover</button><button class="on" data-t="TRANSFER">Transfer</button><button data-t="BANK_PROFIT">Bank profit</button><button data-t="BANK_CHARGE">Bank charge</button><button data-t="RECON">Check balance</button></div><div id="cf"></div><button class="btn" id="csave">Save</button><div id="cerr" class="err"></div></div>' : '') +
         '<h3>Entries</h3><div class="card">' + (c.entries.map((e) => '<div class="ent"><div><b>' + esc(e.type.replace('_', ' ').toLowerCase()) + '</b><div class="muted">' + esc(e.date) + ' · ' + esc([e.from, e.to].filter(Boolean).join(' → ')) + (e.note ? ' · ' + esc(e.note) : '') + '</div></div><div class="amt">' + tk(e.amount) + '</div></div>').join('') || '<div class="muted">None</div>') + '</div>';
       if (!admin) return;
       let t = 'TRANSFER';
       const form = () => {
         const sel = (id, l) => '<label>' + l + '</label><select id="' + id + '">' + accOpts + '</select>';
-        $('#cf').innerHTML = (t === 'TRANSFER' ? sel('cfrom', 'From') + sel('cto', 'To') : t === 'BANK_PROFIT' ? sel('cto', 'Into') : t === 'BANK_CHARGE' ? sel('cfrom', 'From') : sel('cacc', 'Account')) +
+        $('#cf').innerHTML = (t === 'HANDOVER' ? '<label>Who is handing over the cash</label><input id="cperson" list="cpl"><datalist id="cpl">' + (c.collectors || []).map((x) => '<option value="' + esc(x.name) + '">').join('') + '</datalist>' + sel('cto', 'Handed into') : t === 'TRANSFER' ? sel('cfrom', 'From') + sel('cto', 'To') : t === 'BANK_PROFIT' ? sel('cto', 'Into') : t === 'BANK_CHARGE' ? sel('cfrom', 'From') : sel('cacc', 'Account')) +
           '<label>' + (t === 'RECON' ? 'Real balance (count cash / bank statement)' : 'Amount (Tk)') + '</label><input id="camt" type="number" inputmode="numeric"><label>Date</label><input id="cdate" type="date" value="' + today() + '"><label>Note</label><input id="cnote">';
         if (t === 'TRANSFER' && $('#cto').options.length > 1) $('#cto').selectedIndex = 1;
       };
@@ -418,7 +518,7 @@
         try {
           const v = (id) => ($('#' + id) || {}).value;
           if (t === 'RECON') { const r = await api('reconcile', { account: v('cacc'), statementBalance: v('camt'), date: v('cdate'), note: v('cnote') }); alert(r.account + ': real ' + tk(r.statement) + ', app ' + tk(r.app) + (r.difference ? '\nDifference: ' + tk(r.difference) + ' Tk. Find the missing entry.' : '\n✓ Matches')); }
-          else await api('addCash', { type: t, from: v('cfrom'), to: v('cto'), amount: v('camt'), date: v('cdate'), note: v('cnote') });
+          else await api('addCash', { type: t, from: v('cfrom'), to: v('cto'), person: v('cperson'), amount: v('camt'), date: v('cdate'), note: v('cnote') });
           toast('Saved'); viewCash();
         } catch (e) { $('#cerr').textContent = e.message; }
       };
@@ -436,6 +536,73 @@
       if ($('#send')) $('#send').onclick = async () => {
         if (!confirm('Send due reminder SMS to ' + r.list.filter((x) => x.sms).length + ' members now?')) return;
         try { const s = await api('reminders', { send: true }); toast('Sent ' + s.list.filter((x) => x.sms).length + ' SMS'); viewReminders(); } catch (e) { toast(e.message); }
+      };
+    } catch (e) { fail(e); }
+  }
+
+  async function viewReport(args) {
+    if (!isStaff()) { location.hash = '#/more'; return; }
+    const d0 = new Date(); d0.setDate(0); // default: last month
+    const ym = args[0] || (d0.getFullYear() + '-' + String(d0.getMonth() + 1).padStart(2, '0'));
+    busy();
+    try {
+      const r = await api('monthReport', { month: ym });
+      const c = r.collections, e = r.expenses;
+      const kv = (l, v) => '<div class="kv"><span class="l">' + esc(l) + '</span><span class="v">' + esc(v) + '</span></div>';
+      view.innerHTML = '<a href="#/more" class="muted">← More</a><h2>Monthly report</h2><input type="month" id="ym" value="' + esc(ym) + '">' +
+        '<h3>' + esc(r.month) + ' · Collections</h3><div class="card">' + kv('Member deposits', tk(c.deposits) + ' Tk') + kv('Service charge', tk(c.serviceCharge) + ' Tk') + kv('Mosjid Fund', tk(c.mosjid) + ' Tk') + kv('Total received', tk(c.deposits + c.serviceCharge + c.mosjid) + ' Tk') + kv('Entries', c.count) +
+        Object.keys(c.byAccount).map((a) => kv('Into ' + a, tk(c.byAccount[a]) + ' Tk')).join('') + '</div>' +
+        '<h3>Money out</h3><div class="card">' + kv('Somiti expenses', tk(e.Somiti) + ' Tk') + kv('Mosjid expenses', tk(e.Mosjid) + ' Tk') + kv('Member withdrawals', tk(e.Withdrawal || 0) + ' Tk') + kv('Voided entries', r.voided) + '</div>' +
+        (r.balances ? '<h3>Balances now</h3><div class="card">' + Object.keys(r.balances).map((a) => kv(a, tk(r.balances[a]) + ' Tk')).join('') + '</div>' : '') +
+        '<h3>Members</h3><div class="card">' + kv('New members', r.newMembers.length ? r.newMembers.join(', ') : 'none') + kv('Members due', r.due.length) + kv('Inactive (6+ months)', r.due.filter((x) => x.inactive).length) + '</div>' +
+        '<button class="btn" id="rpdf">⬇ Download PDF</button>';
+      $('#ym').onchange = () => { location.hash = '#/report/' + $('#ym').value; };
+      $('#rpdf').onclick = async () => {
+        try {
+          if (!window.jspdf) { await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js'); await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js'); }
+          const clean = (x) => String(x == null ? '' : x).replace(/[^\x20-\x7E]/g, '').trim();
+          const doc = new window.jspdf.jsPDF({ unit: 'pt', format: 'a4' });
+          doc.setFontSize(16); doc.text('At-Taqwa Somiti - Monthly Report', 40, 50); doc.setFontSize(11); doc.text(r.month, 40, 68);
+          const head = { headStyles: { fillColor: [15, 91, 70] }, styles: { fontSize: 9 } };
+          doc.autoTable(Object.assign({ startY: 85, head: [['Collections', 'Tk']], body: [['Member deposits', tk(c.deposits)], ['Service charge', tk(c.serviceCharge)], ['Mosjid Fund', tk(c.mosjid)], ['Total received', tk(c.deposits + c.serviceCharge + c.mosjid)]].concat(Object.keys(c.byAccount).map((a) => ['Into ' + a, tk(c.byAccount[a])])) }, head));
+          doc.autoTable(Object.assign({ head: [['Money out', 'Tk']], body: [['Somiti expenses', tk(e.Somiti)], ['Mosjid expenses', tk(e.Mosjid)], ['Member withdrawals', tk(e.Withdrawal || 0)], ['Voided entries (count)', String(r.voided)]] }, head));
+          if (e.rows.length) doc.autoTable(Object.assign({ head: [['Date', 'Expense', 'Fund', 'Tk']], body: e.rows.map((x) => [x.date, clean(x.purpose), x.fund, tk(x.amount)]) }, head));
+          if (r.balances) doc.autoTable(Object.assign({ head: [['Balance now', 'Tk']], body: Object.keys(r.balances).map((a) => [a, tk(r.balances[a])]) }, head));
+          doc.autoTable(Object.assign({ head: [['Member ID', 'Name', 'Months due', 'Status']], body: r.due.map((x) => [x.mid, clean(x.name), String(x.due), x.inactive ? 'Inactive' : 'Due']) }, head));
+          doc.autoTable(Object.assign({ head: [['Dashboard', 'Value']], body: r.dashboard.flatMap((sct) => sct.items.map((i) => [clean(i.label), clean(i.value)])) }, head));
+          doc.save('Somiti-report-' + ym + '.pdf');
+        } catch (err) { toast(err.message); }
+      };
+    } catch (e) { fail(e); }
+  }
+
+  async function viewHealth() {
+    if (!state.user || state.user.role !== 'admin') { location.hash = '#/more'; return; }
+    busy();
+    try {
+      const list = await api('dataHealth');
+      view.innerHTML = '<a href="#/more" class="muted">← More</a><h2>Data check (' + list.length + ')</h2>' +
+        (list.length ? '<div class="card">' + list.map((x) => '<div class="ent"><div><b>' + esc(x.name) + '</b> <span class="muted">' + esc(x.mid) + '</span><div class="muted">' + esc(x.issue) + '</div></div>' + (/^ATFS-/.test(x.mid) ? '<a class="btn sm sec" href="#/member/' + esc(x.mid) + '">Fix</a>' : /^(ADMIN|MGT)/.test(x.mid) ? '<a class="btn sm sec" href="#/users">Fix</a>' : '') + '</div>').join('') + '</div>' : '<div class="card">✅ Everything looks complete</div>');
+    } catch (e) { fail(e); }
+  }
+
+  async function viewClose(args) {
+    if (!state.user || state.user.role !== 'admin') { location.hash = '#/more'; return; }
+    const mid = args[0]; busy();
+    try {
+      const [p, money] = await Promise.all([api('closePreview', { mid }), moneyAccounts()]);
+      view.innerHTML = '<a href="#/ledger/' + esc(mid) + '" class="muted">← Ledger</a><h2>Close account</h2><div class="card">' +
+        '<div class="kv"><span class="l">Member</span><span class="v">' + esc(p.mid + ' · ' + p.name) + '</span></div><div class="kv"><span class="l">Months paid</span><span class="v">' + p.months + '</span></div>' +
+        '<div class="kv"><span class="l">Deposit to pay back</span><span class="v total">' + tk(p.deposits) + ' Tk</span></div><div class="muted">Service charges are Somiti income and are not paid back.</div></div>' +
+        (!p.ready ? '<div class="card" style="background:var(--redbg)">⚠️ The one-time Dashboard update (applyDashboardV2) has not been run yet.</div>' :
+          p.otherAccounts.length ? '<div class="card" style="background:var(--redbg)">⚠️ This member is Account Holder for ' + esc(p.otherAccounts.join(', ')) + '. Move those accounts to another holder first (More › Users › Link / transfer).</div>' :
+          '<div class="card"><label>Paid to</label><input id="pto" value="' + esc(p.name) + '"><div class="muted">' + (p.nominee ? 'Nominee: ' + esc(p.nominee) : 'No nominee recorded') + '</div><label>Paid from</label><select id="pfrom">' + moneyOpts(money) + '</select><label>Date</label><input id="pdate" type="date" value="' + today() + '"><label>Reason</label><input id="prs" placeholder="e.g. Member left / passed away (paid to nominee)"><button class="btn" id="pgo" style="background:var(--red)">Close account & record payout</button><div id="perr" class="err"></div></div>');
+      if ($('#pgo')) $('#pgo').onclick = async () => {
+        if (!confirm('Close ' + p.mid + ' and pay back ' + tk(p.deposits) + ' Tk to ' + $('#pto').value + '?\nTheir login will be switched off. This cannot be undone from the app.')) return;
+        try {
+          const r = await api('closeAccount', { mid, paidTo: $('#pto').value, paidFrom: $('#pfrom').value, date: $('#pdate').value, reason: $('#prs').value, confirmAmount: p.deposits }); state.accounts = null;
+          view.innerHTML = '<div class="card"><h2>✅ Account closed</h2><div class="kv"><span class="l">Paid</span><span class="v">' + tk(r.paid) + ' Tk</span></div><div class="kv"><span class="l">Voucher</span><span class="v">' + esc(r.voucher) + '</span></div><div class="kv"><span class="l">Paid to</span><span class="v">' + esc(r.paidTo) + '</span></div><a class="btn" href="#/accounts">Back to accounts</a></div>';
+        } catch (e) { $('#perr').textContent = e.message; }
       };
     } catch (e) { fail(e); }
   }
@@ -472,6 +639,7 @@
           '<div class="row" style="margin-top:10px;flex-wrap:wrap">' +
           (u.status === 'active' ? '<button class="btn sm" data-reset="' + esc(u.id) + '">Reset PIN + SMS</button>' : '') +
           (/^ATFS-/.test(u.id) ? '<button class="btn sm sec" data-link="' + esc(u.id) + '">Link / transfer</button>' : '') +
+          '<button class="btn sm sec" data-phone="' + esc(u.id) + '">Edit phone</button>' +
           '</div></div>').join('');
         $('#ul').querySelectorAll('[data-reset]').forEach((b) => b.onclick = async () => {
           const id = b.dataset.reset;
@@ -490,6 +658,12 @@
           const reason = (prompt('Reason (required), e.g. "Child account of ' + to + '"') || '').trim();
           if (!reason) { toast('Reason is required'); return; }
           try { const r = await api('setHolder', { mid, holderUserId: to, reason }); toast('Moved ' + r.moved.join(', ') + ' to ' + r.to); viewUsers(); } catch (e) { toast(e.message, 5000); }
+        });
+        $('#ul').querySelectorAll('[data-phone]').forEach((b) => b.onclick = async () => {
+          const id = b.dataset.phone; const cur = (users.find((x) => x.id === id) || {}).phone || '';
+          const ph = prompt('Mobile number for ' + id + ' (01XXXXXXXXX, or with country code):', cur);
+          if (ph === null) return;
+          try { await api('setUserPhone', { userId: id, phone: ph.trim() }); toast('Saved'); viewUsers(); } catch (e) { toast(e.message); }
         });
         $('#ul').querySelectorAll('[data-perm]').forEach((c) => c.onchange = async () => {
           const id = c.dataset.u;
