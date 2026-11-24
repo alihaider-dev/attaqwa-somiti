@@ -17,7 +17,28 @@
   const moneyOpts = (list, sel) => list.map((a) => '<option' + (a === sel ? ' selected' : '') + '>' + esc(a) + '</option>').join('');
 
   /* ---------- API ---------- */
+  // Speed: read-only screens show the last saved copy instantly, then refresh in the background.
+  const CACHEABLE = ['dashboard', 'accounts', 'ledger', 'transactions', 'expenses', 'cashbook', 'profile', 'moneyAccounts', 'users', 'collectorNames', 'pending', 'monthReport'];
+  const fresh = {};
+  const ckey = (action, data) => 'c_' + (state.user ? state.user.id : '') + '_' + action + '_' + JSON.stringify(data || {});
+  function clearCache() { try { Object.keys(localStorage).filter((k) => k.indexOf('ats_c_') === 0).forEach((k) => localStorage.removeItem(k)); } catch (e) { /* ignore */ } }
   async function api(action, data) {
+    if (CACHEABLE.indexOf(action) < 0) {
+      if (action !== 'login' && action !== 'logout' && action !== 'preview') { clearCache(); state.money = null; }
+      return apiLive(action, data);
+    }
+    const k = ckey(action, data);
+    if (fresh[k] !== undefined) { const d = fresh[k]; delete fresh[k]; return d; }
+    const cached = store.get(k);
+    if (cached === null || cached === undefined) { const d = await apiLive(action, data); store.set(k, d); return d; }
+    const hash = location.hash;
+    apiLive(action, data).then((d) => {
+      store.set(k, d);
+      if (JSON.stringify(d) !== JSON.stringify(cached) && location.hash === hash) { fresh[k] = d; state.accounts = null; go(true); }
+    }).catch(() => {});
+    return cached;
+  }
+  async function apiLive(action, data) {
     if (!CFG.API_URL || CFG.API_URL.indexOf('http') !== 0) throw new Error('App not set up: API_URL missing in config.js');
     const res = await fetch(CFG.API_URL, {
       method: 'POST',
@@ -101,21 +122,22 @@
     member: viewMemberForm, profile: viewProfile, expenses: viewExpenses, cash: viewCash, reminders: viewReminders, backups: viewBackups,
     report: viewReport, health: viewHealth, close: viewClose
   };
-  function go() {
+  function go(keepScroll) {
     const parts = (location.hash || '').replace(/^#\//, '').split('/');
     let name = parts[0];
     if (!state.token) name = 'login';
     else if (!name || name === 'login') { location.hash = isStaff() ? '#/dashboard' : '#/accounts'; return; }
     renderChrome();
+    const y = window.scrollY;
     (routes[name] || viewAccounts)(parts.slice(1));
-    window.scrollTo(0, 0);
+    if (keepScroll === true) setTimeout(() => window.scrollTo(0, y), 50); else window.scrollTo(0, 0);
   }
-  window.addEventListener('hashchange', go);
+  window.addEventListener('hashchange', () => go());
 
   function logout(silent) {
     if (state.token && !silent) api('logout').catch(() => {});
     state.token = null; state.user = null; state.accounts = null;
-    store.del('token'); store.del('user');
+    clearCache(); store.del('token'); store.del('user');
     location.hash = '#/login';
     if (silent) toast('Please log in again');
   }
