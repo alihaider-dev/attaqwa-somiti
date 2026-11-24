@@ -157,6 +157,9 @@
       if (!b) { b = document.createElement('div'); b.id = 'offl'; b.className = 'offl'; b.setAttribute('role', 'status'); b.textContent = 'No internet · showing saved data. Saving is not possible now.'; document.body.appendChild(b); }
     } else if (b) { b.remove(); if (state.token) go(true); }
   }
+  // iPhone ignores the viewport "no zoom" setting, so the pinch gesture itself is cancelled.
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach((ev) => document.addEventListener(ev, (e) => e.preventDefault(), { passive: false }));
+  document.addEventListener('touchmove', (e) => { if (e.touches && e.touches.length > 1) e.preventDefault(); }, { passive: false });
   window.addEventListener('online', netBar); window.addEventListener('offline', netBar);
   function fail(e) { view.innerHTML = '<div class="card"><b>Could not load</b><div class="err">' + esc(e.message) + '</div><button class="btn sec" id="retry">Try again</button></div>'; $('#retry').onclick = () => go(); }
 

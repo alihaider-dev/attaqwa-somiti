@@ -119,3 +119,6 @@ a.tile:active{background:var(--g2)}
 div[data-mid]:focus-visible{outline-offset:-2px}
 .kv .v,.item .t,.ent b{overflow-wrap:anywhere}
 .item>div:first-child,.ent>div:first-child{min-width:0}
+
+/* no pinch zoom / double-tap zoom: the app should feel like a native app (scrolling still works) */
+html,body{touch-action:pan-x pan-y;-webkit-text-size-adjust:100%}
