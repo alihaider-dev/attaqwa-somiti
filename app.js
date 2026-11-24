@@ -120,7 +120,7 @@
     login: viewLogin, dashboard: viewDashboard, accounts: viewAccounts, ledger: viewLedger,
     pay: viewPay, tx: viewTx, more: viewMore, users: viewUsers,
     member: viewMemberForm, profile: viewProfile, expenses: viewExpenses, cash: viewCash, reminders: viewReminders, backups: viewBackups,
-    report: viewReport, health: viewHealth, close: viewClose
+    report: viewReport, health: viewHealth, close: viewClose, scdue: viewScDue
   };
   function go(keepScroll) {
     const parts = (location.hash || '').replace(/^#\//, '').split('/');
@@ -198,7 +198,7 @@
         const draw = () => {
           const q = $('#q').value.toLowerCase();
           $('#al').innerHTML = list.filter((a) => !q || (a.name + ' ' + a.mid).toLowerCase().indexOf(q) >= 0).map((a) =>
-            '<div class="item" data-mid="' + esc(a.mid) + '"><div><div class="t">' + esc(a.name) + (a.inactive ? ' <span class="chip due">Inactive</span>' : '') + '</div><div class="s">' + esc(a.mid) + ' · ' + esc(a.totalDeposit) + ' Tk · up to ' + esc(a.paidUpTo) + (a.holder && a.holder !== a.mid ? ' · under ' + esc(a.holder) : '') + '</div></div>' + statusChip(a.status) + '</div>').join('') +
+            '<div class="item" data-mid="' + esc(a.mid) + '"><div><div class="t">' + esc(a.name) + (a.inactive ? ' <span class="chip due">Inactive</span>' : '') + (a.scOwed ? ' <span class="chip due">SC due ' + tk(a.scOwed) + '</span>' : '') + '</div><div class="s">' + esc(a.mid) + ' · ' + esc(a.totalDeposit) + ' Tk · up to ' + esc(a.paidUpTo) + (a.holder && a.holder !== a.mid ? ' · under ' + esc(a.holder) : '') + '</div></div>' + statusChip(a.status) + '</div>').join('') +
             '<div class="item" data-mid="ATFS-0000"><div><div class="t">🕌 Mosjid Fund</div><div class="s">ATFS-0000 · donations</div></div><span class="chip">Fund</span></div>';
           $('#al').querySelectorAll('[data-mid]').forEach((el) => el.onclick = () => location.hash = '#/ledger/' + el.dataset.mid);
         };
@@ -222,10 +222,12 @@
           '<div class="kv"><span class="l">Total deposit</span><span class="v">' + esc(s.totalDeposit) + ' Tk</span></div>' +
           '<div class="kv"><span class="l">Service charge</span><span class="v">' + esc(s.serviceCharge) + ' Tk</span></div>' +
           '<div class="kv"><span class="l">Paid up to</span><span class="v">' + esc(s.paidUpTo) + '</span></div>' +
-          '<div class="kv"><span class="l">Status</span><span class="v">' + statusChip(s.status) + '</span></div>'
+          '<div class="kv"><span class="l">Status</span><span class="v">' + statusChip(s.status) + '</span></div>' +
+          (L.scOwed ? '<div class="kv"><span class="l">Service charge due</span><span class="v" style="color:var(--red)">' + tk(L.scOwed) + ' Tk</span></div>' : '')
           : '<div class="kv"><span class="l">Total received</span><span class="v">' + tk(total) + ' Tk</span></div>') +
         '</div><button class="btn sec" id="pdf">⬇ Download statement (PDF)</button>' +
         (L.mid !== 'ATFS-0000' ? '<a class="btn sec" href="#/profile/' + esc(L.mid) + '">👤 Member profile</a>' : '') +
+        (L.scOwed && can('payments') ? '<a class="btn" href="#/scdue/' + esc(L.mid) + '">Collect service charge due (' + tk(L.scOwed) + ' Tk)</a>' : '') +
         (L.donations && L.donations.length ? '<h3>Mosjid Fund donations (' + tk(L.donations.reduce((t, d) => t + d.amount, 0)) + ' Tk)</h3><div class="card">' + L.donations.map((d) => '<div class="ent"><div><b>' + esc(d.date) + '</b><div class="muted">' + esc(d.receipt) + '</div></div><div class="amt">' + tk(d.amount) + '</div></div>').join('') + '</div>' : '') +
         '<h3>History (' + L.entries.length + ')</h3><div class="card">' +
         (L.entries.map((e, i) => '<div class="ent"><div><b>' + esc(e.forMonth) + '</b><div class="muted">Paid ' + esc(e.date) + (e.receipt ? ' · ' + esc(e.receipt) : '') + (e.remarks ? ' · ' + esc(e.remarks) : '') + '</div>' +
@@ -284,7 +286,10 @@
     view.innerHTML = '<h2>New Payment</h2><div class="tabs"><button class="' + (mode === 'member' ? 'on' : '') + '" onclick="location.hash=\'#/pay\'">Member deposit</button><button class="' + (mode === 'mosjid' ? 'on' : '') + '" onclick="location.hash=\'#/pay/mosjid\'">🕌 Mosjid Fund</button></div>' +
       '<div class="card">' + (mode === 'member'
         ? '<label>Member</label><select id="mid"><option value="">Choose member…</option>' + opts + '</select>' +
+          '<div id="minfo"></div>' +
           '<label>Number of months</label><div class="stepper"><button type="button" id="minus">−</button><input id="cnt" type="number" min="1" max="60" value="1" inputmode="numeric"><button type="button" id="plus">+</button></div>' +
+          '<label style="display:flex;gap:8px;align-items:center;margin-top:14px;color:var(--ink)"><input type="checkbox" id="scnow" checked style="width:auto"> Service charge paid now</label>' +
+          '<label id="oldwrap" style="display:none;gap:8px;align-items:center;color:var(--ink)"><input type="checkbox" id="oldsc" style="width:auto"> <span id="oldtxt"></span></label>' +
           common + '<label>Remarks (optional)</label><input id="rm">'
         : '<label>Donors</label><div id="donors"></div><button type="button" class="btn sm sec" id="addd" style="margin-top:8px">+ Add donor</button>' +
           '<div class="preview"><div class="kv"><span class="l">Total</span><span class="v total" id="dtot">0 Tk</span></div></div>' + common) +
@@ -322,7 +327,18 @@
 
     let pv = null;
     const reset = () => { pv = null; $('#pv').innerHTML = ''; $('#go').textContent = 'Preview'; };
-    $('#mid').onchange = reset; $('#cnt').oninput = reset;
+    const showMember = () => {
+      reset();
+      const a = list.find((x) => x.mid === $('#mid').value);
+      if (!a) { $('#minfo').innerHTML = ''; $('#oldwrap').style.display = 'none'; return; }
+      const due = (String(a.status).match(/^(\d+)\s*Due/i) || [])[1];
+      $('#minfo').innerHTML = '<div class="preview" style="margin-top:10px"><div class="kv"><span class="l">Paid up to</span><span class="v">' + esc(a.paidUpTo) + '</span></div><div class="kv"><span class="l">Status</span><span class="v">' + statusChip(a.status) + '</span></div>' +
+        (due ? '<div class="kv"><span class="l">Due amount</span><span class="v" style="color:var(--red)">' + tk(Number(due) * 1000) + ' Tk (' + due + ' months)</span></div>' : '') +
+        (a.scOwed ? '<div class="kv"><span class="l">Service charge due</span><span class="v" style="color:var(--red)">' + tk(a.scOwed) + ' Tk (' + a.scMonths + ' months)</span></div>' : '') + '</div>';
+      $('#cnt').value = due ? Math.min(60, Number(due)) : 1;
+      if (a.scOwed) { $('#oldwrap').style.display = 'flex'; $('#oldsc').checked = false; $('#oldtxt').textContent = 'Also collect old service charge due (' + tk(a.scOwed) + ' Tk)'; } else { $('#oldwrap').style.display = 'none'; $('#oldsc').checked = false; }
+    };
+    $('#mid').onchange = showMember; $('#cnt').oninput = reset; $('#scnow').onchange = reset; $('#oldsc').onchange = reset;
     $('#minus').onclick = () => { $('#cnt').value = Math.max(1, (+$('#cnt').value || 1) - 1); reset(); };
     $('#plus').onclick = () => { $('#cnt').value = Math.min(60, (+$('#cnt').value || 1) + 1); reset(); };
     $('#go').onclick = async () => {
@@ -333,17 +349,23 @@
         if (!pv) {
           b.textContent = 'Checking…';
           pv = await api('preview', { mid, count: $('#cnt').value });
+          const n = pv.months.length; const scNow = $('#scnow').checked; const old = $('#oldsc').checked ? (pv.scOwed || 0) : 0;
+          pv.grand = pv.deposit * n + (scNow ? pv.sc * n : 0) + old;
           $('#pv').innerHTML = '<div class="preview"><div class="kv"><span class="l">Last paid</span><span class="v">' + esc(pv.lastPaid) + '</span></div>' +
-            '<div class="kv"><span class="l">Months</span><span class="v">' + esc(pv.months.length === 1 ? pv.months[0] : pv.months[0] + ' → ' + pv.months[pv.months.length - 1]) + ' (' + pv.months.length + ')</span></div>' +
-            '<div class="kv"><span class="l">Deposit + service charge</span><span class="v">' + tk(pv.deposit) + ' + ' + tk(pv.sc) + ' × ' + pv.months.length + '</span></div>' +
-            '<div class="kv"><span class="l">Total to collect</span><span class="v total">' + tk(pv.total) + ' Tk</span></div></div>';
+            '<div class="kv"><span class="l">Months</span><span class="v">' + esc(n === 1 ? pv.months[0] : pv.months[0] + ' → ' + pv.months[n - 1]) + ' (' + n + ')</span></div>' +
+            '<div class="kv"><span class="l">Deposit</span><span class="v">' + tk(pv.deposit) + ' × ' + n + ' = ' + tk(pv.deposit * n) + '</span></div>' +
+            '<div class="kv"><span class="l">Service charge</span><span class="v">' + (scNow ? tk(pv.sc) + ' × ' + n + ' = ' + tk(pv.sc * n) : '<span style="color:var(--red)">not paid now (' + tk(pv.sc * n) + ' Tk will show as due)</span>') + '</span></div>' +
+            (old ? '<div class="kv"><span class="l">Old service charge</span><span class="v">' + tk(old) + '</span></div>' : '') +
+            '<div class="kv"><span class="l">Total to collect</span><span class="v total">' + tk(pv.grand) + ' Tk</span></div></div>';
           b.textContent = 'Confirm & save'; b.disabled = false;
         } else {
           b.textContent = 'Saving…';
           const cbIn = $('#cb').value;
-          const r = await api('addPayment', { mid, count: pv.months.length, expectFirst: pv.months[0], depositDate: $('#dd').value, collectedBy: $('#cb').value, remarks: $('#rm').value, account: $('#acct').value });
+          const r = await api('addPayment', { mid, count: pv.months.length, expectFirst: pv.months[0], depositDate: $('#dd').value, collectedBy: $('#cb').value, remarks: $('#rm').value, account: $('#acct').value, scPaid: $('#scnow').checked, collectOldSc: $('#oldsc').checked });
           state.accounts = null;
           view.innerHTML = '<div class="card"><h2>✅ Saved</h2><div class="kv"><span class="l">Receipt</span><span class="v">' + esc(r.receipt) + '</span></div><div class="kv"><span class="l">Member</span><span class="v">' + esc(r.mid + ' · ' + r.name) + '</span></div><div class="kv"><span class="l">Months</span><span class="v">' + esc(r.months.join(', ')) + '</span></div><div class="kv"><span class="l">Total</span><span class="v">' + tk(r.total) + ' Tk</span></div>' +
+            (r.oldSc ? '<div class="kv"><span class="l">Incl. old service charge</span><span class="v">' + tk(r.oldSc) + ' Tk</span></div>' : '') +
+            (r.scSkipped ? '<div class="kv"><span class="l">Service charge</span><span class="v" style="color:var(--red)">not paid now: shows as due</span></div>' : '') +
             (r.sms && !r.waOnly ? '<div class="kv"><span class="l">SMS</span><span class="v muted">' + esc(r.sms) + '</span></div>' : '') +
             (r.wa ? '<a class="btn ' + (r.waOnly ? '' : 'sec') + '" style="background:' + (r.waOnly ? '#25D366' : '') + '" href="' + esc(r.wa) + '" target="_blank" rel="noopener">💬 Send on WhatsApp' + (r.waOnly ? ' (no SMS for this number)' : '') + '</a>' : '') +
             '<button class="btn sec" id="shr">🧾 Share receipt image</button><a class="btn" href="#/ledger/' + esc(r.mid) + '">View ledger</a><a class="btn sec" href="#/pay" onclick="setTimeout(()=>location.reload(),50)">New payment</a></div>';
@@ -373,7 +395,7 @@
     if (admin) links.push(['#/member', '➕ Add member'], ['#/users', '👤 Users & account linking']);
     if (can('expenses')) links.push(['#/expenses', '💸 Expenses']);
     if (isStaff()) links.push(['#/cash', '🏦 Cash book (Cash / Bank / bKash)']);
-    if (isStaff()) links.push(['#/report', '📄 Monthly report']);
+    if (isStaff()) links.push(['#/scdue', '🧮 Service charge due'], ['#/report', '📄 Monthly report']);
     if (admin) links.push(['#/reminders', '🔔 Due reminders'], ['#/health', '🩺 Data check'], ['#/backups', '🗄️ Backups']);
     view.innerHTML = '<h2>' + (isStaff() ? 'More' : 'Settings') + '</h2>' + (links.length ? '<div class="card list">' + links.map(([h, l]) => '<a class="item" href="' + h + '" style="color:inherit;text-decoration:none"><span class="t">' + l + '</span><span class="muted">›</span></a>').join('') + '</div>' : '') +
       '<div class="card" style="margin-top:16px"><b>Change PIN</b><label>Current PIN</label><input id="op" type="password" inputmode="numeric" maxlength="6"><label>New PIN (4 to 6 digits)</label><input id="np" type="password" inputmode="numeric" maxlength="6"><button class="btn" id="cp">Change PIN</button><div id="cerr" class="err"></div></div>' +
@@ -559,6 +581,33 @@
         if (!confirm('Send due reminder SMS to ' + r.list.filter((x) => x.sms).length + ' members now?')) return;
         try { const s = await api('reminders', { send: true }); toast('Sent ' + s.list.filter((x) => x.sms).length + ' SMS'); viewReminders(); } catch (e) { toast(e.message); }
       };
+    } catch (e) { fail(e); }
+  }
+
+  async function viewScDue(args) {
+    if (!isStaff()) { location.hash = '#/more'; return; }
+    const only = args[0] || '';
+    busy();
+    try {
+      const [list0, money] = await Promise.all([api('scDue'), moneyAccounts()]);
+      const list = only ? list0.filter((x) => x.mid === only) : list0;
+      const total = list0.reduce((t, x) => t + x.amount, 0);
+      view.innerHTML = '<a href="' + (only ? '#/ledger/' + esc(only) : '#/more') + '" class="muted">← Back</a><h2>Service charge due</h2>' +
+        (!only ? '<div class="card"><div class="muted">Total not yet paid</div><div class="total">' + tk(total) + ' Tk</div><div class="muted">' + list0.length + ' member(s)</div></div>' : '') +
+        (can('payments') && list.length ? '<div class="card"><label>Received into</label><select id="sacct">' + moneyOpts(money) + '</select><label>Collected by</label><input id="scb" placeholder="Who received the money"><label>Date</label><input id="sdate" type="date" value="' + today() + '"></div>' : '') +
+        '<div class="card">' + (list.map((x) => '<div class="ent"><div><b>' + esc(x.name) + '</b> <span class="muted">' + esc(x.mid) + '</span><div class="muted">' + esc(x.months.join(', ')) + '</div>' +
+          (can('payments') ? '<button class="btn sm" data-col="' + esc(x.mid) + '" style="margin-top:6px">Collect ' + tk(x.amount) + ' Tk</button>' : '') + '</div><div class="amt" style="color:var(--red)">' + tk(x.amount) + '</div></div>').join('') || '<div class="muted">✅ No service charge due</div>') + '</div>';
+      view.querySelectorAll('[data-col]').forEach((b) => b.onclick = async () => {
+        const x = list.find((y) => y.mid === b.dataset.col);
+        if (!confirm('Collect ' + tk(x.amount) + ' Tk service charge from ' + x.mid + ' (' + x.name + ') for ' + x.months.length + ' month(s)?')) return;
+        b.disabled = true; b.textContent = 'Saving…';
+        try {
+          const r = await api('collectSc', { mid: x.mid, account: $('#sacct').value, collectedBy: $('#scb').value, date: $('#sdate').value });
+          toast('Saved ' + r.receipt + ' · ' + tk(r.amount) + ' Tk');
+          if (r.waOnly && r.wa) window.open(r.wa, '_blank');
+          state.accounts = null; viewScDue(args);
+        } catch (e) { toast(e.message, 5000); b.disabled = false; b.textContent = 'Collect ' + tk(x.amount) + ' Tk'; }
+      });
     } catch (e) { fail(e); }
   }
 
