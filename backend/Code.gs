@@ -1266,7 +1266,9 @@ function scUndoReceipt_(recv, v, receipt, skipRows, now, u, reason) {
   sv.forEach((r, i) => { if (String(r[7]).trim() === receipt) { del.push(i + 2); out.total += num_(r[4]); out.copies.push([now, u.UserID, reason, CFG.TABS.SCC, receipt, String(r[1]), num_(r[4]), JSON.stringify(r)]); } });
   if (!del.length) return out;
   const skip = {}; (skipRows || []).forEach(rn => skip[rn] = true);
-  v.forEach((r, i) => { const rn = i + 2; if (!skip[rn] && String(r[13] || '').trim() === receipt) { recv.getRange(rn, 6).setValue(0); recv.getRange(rn, 14).setValue(''); out.months++; } });
+  const back = []; v.forEach((r, i) => { const rn = i + 2; if (!skip[rn] && String(r[13] || '').trim() === receipt) back.push(rn); });
+  if (back.length) { recv.getRangeList(back.map(rn => 'F' + rn)).setValue(0); recv.getRangeList(back.map(rn => 'N' + rn)).setValue(''); }
+  out.months = back.length;
   del.sort((a, b) => b - a).forEach(rn => s.deleteRow(rn));
   return out;
 }
@@ -1546,7 +1548,9 @@ function scCollectLocked_(u, mid, opts) {
   const rate = num_(getSettings_().SERVICE_CHARGE_PER_MONTH);
   const receipt = opts.receipt || nextReceipt_();
   const s = sh_(CFG.TABS.RECEIVE);
-  rows.forEach(rn => { s.getRange(rn, 6).setValue(rate); s.getRange(rn, 14).setValue(receipt); });
+  // Two writes in total, however many months (was two per month).
+  s.getRangeList(rows.map(rn => 'F' + rn)).setValue(rate);
+  s.getRangeList(rows.map(rn => 'N' + rn)).setValue(receipt);
   const months = rows.map(rn => due.months[due.rows.indexOf(rn)]);
   const amount = rows.length * rate;
   const info = readInfo_()[mid] || {};

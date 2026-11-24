@@ -148,7 +148,7 @@
   const monthLabel = (k) => MON[k % 12] + '-' + Math.floor(k / 12);
 
   function busy(text) { dirty = false; view.innerHTML = '<div class="loading">' + esc(text || 'Loading…') + '</div>'; }
-  function fail(e) { view.innerHTML = '<div class="card"><b>Could not load</b><div class="err">' + esc(e.message) + '</div><button class="btn sec" onclick="location.reload()">Try again</button></div>'; }
+  function fail(e) { view.innerHTML = '<div class="card"><b>Could not load</b><div class="err">' + esc(e.message) + '</div><button class="btn sec" id="retry">Try again</button></div>'; $('#retry').onclick = () => go(); }
 
   const isStaff = () => state.user && (state.user.role === 'admin' || state.user.role === 'management');
   const can = (p) => state.user && (state.user.role === 'admin' || (state.user.role === 'management' && (state.user.perms || []).indexOf(p) >= 0));
@@ -562,7 +562,7 @@
   const MF = [['name', 'Full name *'], ['phone', 'Mobile (01XXXXXXXXX or with country code)'], ['father', "Father's name"], ['mother', "Mother's name"],
     ['nid', 'NID number'], ['dob', 'Date of birth'], ['presentAddress', 'Present address'], ['permanentAddress', 'Permanent address'],
     ['profession', 'Profession'], ['bloodGroup', 'Blood group'], ['email', 'Email'], ['nationality', 'Nationality'],
-    ['nominee', 'Nominee name'], ['nomineeRelation', 'Nominee relation'], ['nomineeAddress', 'Nominee address'], ['monthlyDeposit', 'Monthly deposit (Tk)']];
+    ['nominee', 'Nominee name'], ['nomineeRelation', 'Nominee relation'], ['nomineeAddress', 'Nominee address']]; // monthly deposit is one rate for everyone (Dashboard), so it is not asked per member
 
   async function viewMemberForm(args) {
     if (!state.user || state.user.role !== 'admin') { location.hash = '#/more'; return; }
@@ -586,7 +586,8 @@
         state.accounts = null;
         view.innerHTML = '<div class="card"><h2>✅ Member added</h2><div class="kv"><span class="l">Member ID</span><span class="v">' + esc(r.mid) + '</span></div>' +
           (r.pin ? '<div class="kv"><span class="l">First PIN</span><span class="v">' + esc(r.pin.pin) + '</span></div><div class="kv"><span class="l">SMS</span><span class="v muted">' + esc(r.pin.waOnly ? 'foreign number, use WhatsApp' : r.pin.sms || '-') + '</span></div>' + (r.pin.wa ? '<a class="btn sec" target="_blank" rel="noopener" href="' + esc(r.pin.wa) + '">💬 Send PIN on WhatsApp</a>' : '') : '') +
-          '<a class="btn" href="#/pay">Take first payment</a><a class="btn sec" href="#/member" onclick="setTimeout(()=>location.reload(),50)">Add another</a></div>';
+          '<a class="btn" href="#/pay/' + esc(r.mid) + '">Take first payment</a><button type="button" class="btn sec" id="addmore">Add another</button></div>';
+        $('#addmore').onclick = () => viewMemberForm([]);
       } catch (e) { $('#ferr').textContent = e.message; b.disabled = false; b.textContent = mid ? 'Save changes' : 'Add member'; }
     };
   }
