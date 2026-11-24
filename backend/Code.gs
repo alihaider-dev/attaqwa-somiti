@@ -152,8 +152,8 @@ function ensureHeaders_(sheet, startCol, names) {
   const cur = sheet.getRange(1, startCol, 1, names.length).getValues()[0];
   names.forEach((n, i) => { if (String(cur[i]).trim() === '') sheet.getRange(1, startCol + i).setValue(n).setFontWeight('bold'); });
 }
-/** Sets a number format, but quietly skips columns that are typed (Sheets tables format those themselves). */
-function fmt_(range, f) { try { range.setNumberFormat(f); } catch (e) { /* typed table column: format is already set */ } }
+/* No number formats are set on Receive/Expenses: they are Sheets tables with typed columns that format dates themselves
+   (setting a format there fails, and Google only reports it after the rows are already saved). */
 function markDirty_() { bust_(); props_().setProperty('BACKUP_DIRTY', String(Date.now())); }
 
 /* ---------------- one-time setup ---------------- */
@@ -503,9 +503,6 @@ function writeReceive_(rows) {
   const start = lastFilledRow_(s, 3) + 1;
   rows = rows.map(r => { const x = r.slice(); while (x.length < 13) x.push(''); x[0] = dateOut_(x[0]); x[1] = dateOut_(x[1]); return x; });
   s.getRange(start, 1, rows.length, 13).setValues(rows);
-  fmt_(s.getRange(start, 1, rows.length, 1), 'd-mmm-yyyy');
-  fmt_(s.getRange(start, 2, rows.length, 1), 'mmm-yyyy');
-  fmt_(s.getRange(start, 10, rows.length, 1), 'd-mmm-yyyy h:mm am/pm');
   SpreadsheetApp.flush();
   // Verify every row landed (fixes the "vanished entry" problem: we never report success unless it's really there).
   const back = s.getRange(start, 3, rows.length, 1).getValues();
@@ -837,7 +834,6 @@ function writeExpense_(u, data, approvedBy) {
     voucher = nextReceipt_().replace(/^[A-Z]+/, 'EXP');
     const remarks = data.remarks + (approvedBy ? (data.remarks ? ' · ' : '') + 'approved by ' + approvedBy : '');
     s.getRange(row, 1, 1, 9).setValues([[dateOut_(toDate_(data.date) || new Date()), data.purpose, data.amount, remarks, data.fund, data.paidFrom, voucher, new Date(), u.UserID]]);
-    fmt_(s.getRange(row, 1), 'd-mmm-yyyy');
     SpreadsheetApp.flush();
     if (num_(s.getRange(row, 3).getValue()) !== data.amount) throw new Error('Save check failed. Check the Expenses tab.');
     audit_(u, 'add_expense', { voucher, amount: data.amount, fund: data.fund, acct: data.paidFrom, purpose: data.purpose, approvedBy });
@@ -1140,7 +1136,6 @@ function closeAccount_(u, b) {
       const s = sh_(CFG.TABS.EXP); const row = lastFilledRow_(s, 3) + 1;
       voucher = nextReceipt_().replace(/^[A-Z]+/, 'WDL');
       s.getRange(row, 1, 1, 9).setValues([[dateOut_(toDate_(b.date) || new Date()), 'Member withdrawal ' + mid + ' (' + pv.name + ')', pv.deposits, 'Paid to: ' + paidTo + '. ' + reason, 'Withdrawal', acct, voucher, new Date(), u.UserID]]);
-      fmt_(s.getRange(row, 1), 'd-mmm-yyyy');
     }
     t.sheet.getRange(readInfo_()[mid].row, c + 1).setValue('Closed');
     const usr = rowsAsObjects_(CFG.TABS.USERS, USER_COLS).find(x => x.UserID === mid);
