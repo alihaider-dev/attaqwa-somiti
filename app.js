@@ -18,14 +18,30 @@
 
   /* ---------- API ---------- */
   // Speed: read-only screens show the last saved copy instantly, then refresh in the background.
-  const CACHEABLE = ['dashboard', 'accounts', 'ledger', 'transactions', 'expenses', 'cashbook', 'profile', 'moneyAccounts', 'users', 'collectorNames', 'pending', 'monthReport'];
+  const CACHEABLE = ['scDue', 'scHistory', 'dashboard', 'accounts', 'ledger', 'transactions', 'expenses', 'cashbook', 'profile', 'moneyAccounts', 'users', 'collectorNames', 'pending', 'monthReport'];
   const fresh = {};
+  // True once the user has typed or picked something on the current screen: then a background refresh must not redraw it.
+  let dirty = false;
+  document.addEventListener('input', () => { dirty = true; }, true);
+  document.addEventListener('change', () => { dirty = true; }, true);
+  // One-time save ID: a retry of the SAME save (after no answer) carries the same ID, so the server saves it only once.
+  const ONCE = ['addPayment', 'addMosjid', 'addExpense', 'addCash', 'reconcile', 'collectSc', 'decide', 'closeAccount', 'voidEntry', 'addMember'];
+  const newNonce = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  let nonce = newNonce();
+  function ridOf(action, data) {
+    const str = action + '|' + JSON.stringify(data || {}); let h = 0;
+    for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+    return nonce + '.' + (h >>> 0).toString(36) + '.' + str.length;
+  }
   const ckey = (action, data) => 'c_' + (state.user ? state.user.id : '') + '_' + action + '_' + JSON.stringify(data || {});
   function clearCache() { try { Object.keys(localStorage).filter((k) => k.indexOf('ats_c_') === 0).forEach((k) => localStorage.removeItem(k)); } catch (e) { /* ignore */ } }
   async function api(action, data) {
     if (CACHEABLE.indexOf(action) < 0) {
       if (action !== 'login' && action !== 'logout' && action !== 'preview') { clearCache(); state.money = null; }
-      return apiLive(action, data);
+      if (ONCE.indexOf(action) < 0) return apiLive(action, data);
+      const d = await apiLive(action, Object.assign({ rid: ridOf(action, data) }, data || {}), true);
+      nonce = newNonce(); // saved: the next save is a new one
+      return d;
     }
     const k = ckey(action, data);
     if (fresh[k] !== undefined) { const d = fresh[k]; delete fresh[k]; return d; }
@@ -34,20 +50,30 @@
     const hash = location.hash;
     apiLive(action, data).then((d) => {
       store.set(k, d);
-      if (JSON.stringify(d) !== JSON.stringify(cached) && location.hash === hash) { fresh[k] = d; state.accounts = null; go(true); }
+      if (JSON.stringify(d) !== JSON.stringify(cached) && location.hash === hash && !dirty) { fresh[k] = d; state.accounts = null; go(true); }
     }).catch(() => {});
     return cached;
   }
-  async function apiLive(action, data) {
+  async function apiLive(action, data, isSave) {
     if (!CFG.API_URL || CFG.API_URL.indexOf('http') !== 0) throw new Error('App not set up: API_URL missing in config.js');
-    const res = await fetch(CFG.API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight with Apps Script
-      body: JSON.stringify(Object.assign({ action, token: state.token }, data || {}))
-    });
-    const j = await res.json();
+    const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), isSave ? 60000 : 45000);
+    let j;
+    try {
+      const res = await fetch(CFG.API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight with Apps Script
+        body: JSON.stringify(Object.assign({ action, token: state.token }, data || {})),
+        signal: ctl.signal
+      });
+      j = await res.json();
+    } catch (e) {
+      // No answer: we cannot know if a save went through. Tapping the same button again is safe (same save ID).
+      throw new Error(isSave ? 'No answer from the server. It may or may not be saved. Tap the button again to check: it will not be saved twice.'
+        : (navigator.onLine === false ? 'No internet. Check your connection and try again.' : 'The server is slow or not reachable. Try again.'));
+    } finally { clearTimeout(timer); }
     if (!j.ok) {
       if (j.code === 'AUTH') { logout(true); }
+      if (j.code === 'PIN' && state.user) { state.user.mustChangePin = true; store.set('user', state.user); location.hash = '#/setpin'; }
       throw new Error(j.error || 'Something went wrong');
     }
     return j.data;
@@ -57,7 +83,7 @@
     const t = $('#toast'); t.textContent = msg; t.classList.remove('hidden');
     clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.add('hidden'), ms || 3000);
   }
-  function busy(text) { view.innerHTML = '<div class="loading">' + esc(text || 'Loading…') + '</div>'; }
+  function busy(text) { dirty = false; view.innerHTML = '<div class="loading">' + esc(text || 'Loading…') + '</div>'; }
   function fail(e) { view.innerHTML = '<div class="card"><b>Could not load</b><div class="err">' + esc(e.message) + '</div><button class="btn sec" onclick="location.reload()">Try again</button></div>'; }
 
   const isStaff = () => state.user && (state.user.role === 'admin' || state.user.role === 'management');
@@ -91,7 +117,7 @@
   async function voidFlow(payload, what, after) {
     const reason = (prompt('VOID ' + what + '\nThis removes it from the totals (a copy is kept in App_Voided).\n\nReason (required):') || '').trim();
     if (!reason) return;
-    try { const r = await api('voidEntry', Object.assign({ reason }, payload)); toast('Voided ' + r.voided + ' row(s), ' + tk(r.total) + ' Tk'); state.accounts = null; after && after(); }
+    try { const r = await api('voidEntry', Object.assign({ reason }, payload)); toast('Voided ' + r.voided + ' row(s), ' + tk(r.total) + ' Tk' + (r.scUndone ? ' (incl. ' + tk(r.scUndone) + ' Tk old service charge, now due again)' : ''), 5000); state.accounts = null; after && after(); }
     catch (e) { toast(e.message, 5000); }
   }
   let collectorCache = null;
@@ -109,6 +135,7 @@
   function renderChrome() {
     const nav = $('#nav');
     if (!state.user) { nav.classList.add('hidden'); $('#who').textContent = ''; return; }
+    if (state.user.mustChangePin) { nav.classList.add('hidden'); $('#who').textContent = state.user.id; return; }
     $('#who').innerHTML = esc(state.user.name) + '<br>' + esc(state.user.id) + ' · ' + esc(state.user.role);
     const cur = location.hash.split('/').slice(0, 2).join('/');
     nav.innerHTML = navItems().map(([h, i, l]) => '<a href="' + h + '" class="' + (cur === h ? 'on' : '') + '"><span class="i">' + i + '</span>' + l + '</a>').join('');
@@ -120,13 +147,15 @@
     login: viewLogin, dashboard: viewDashboard, accounts: viewAccounts, ledger: viewLedger,
     pay: viewPay, tx: viewTx, more: viewMore, users: viewUsers,
     member: viewMemberForm, profile: viewProfile, expenses: viewExpenses, cash: viewCash, reminders: viewReminders, backups: viewBackups,
-    report: viewReport, health: viewHealth, close: viewClose, scdue: viewScDue
+    report: viewReport, health: viewHealth, close: viewClose, scdue: viewScDue, setpin: viewSetPin
   };
   function go(keepScroll) {
     const parts = (location.hash || '').replace(/^#\//, '').split('/');
     let name = parts[0];
     if (!state.token) name = 'login';
+    else if (state.user && state.user.mustChangePin && name !== 'setpin') { location.hash = '#/setpin'; return; }
     else if (!name || name === 'login') { location.hash = isStaff() ? '#/dashboard' : '#/accounts'; return; }
+    dirty = false;
     renderChrome();
     const y = window.scrollY;
     (routes[name] || viewAccounts)(parts.slice(1));
@@ -158,6 +187,28 @@
         state.token = r.token; state.user = r.user; store.set('token', r.token); store.set('user', r.user);
         location.hash = isStaff() ? '#/dashboard' : '#/accounts';
       } catch (err) { $('#lerr').textContent = err.message; b.disabled = false; b.textContent = 'Log in'; }
+    };
+  }
+
+  /* First login (or after a PIN reset): the user must choose a PIN only they know. */
+  function viewSetPin() {
+    if (!state.user || !state.user.mustChangePin) { location.hash = isStaff() ? '#/dashboard' : '#/accounts'; return; }
+    view.innerHTML = '<div class="login card"><h2>Set your own PIN</h2><div class="muted">The PIN you were given is only for the first login. Choose a new 6-digit PIN that only you know.</div>' +
+      '<form id="sf"><label for="so">PIN you were given</label><input id="so" type="password" inputmode="numeric" autocomplete="current-password" maxlength="6" required>' +
+      '<label for="sn">New PIN (6 digits)</label><input id="sn" type="password" inputmode="numeric" autocomplete="new-password" maxlength="6" required>' +
+      '<label for="sn2">New PIN again</label><input id="sn2" type="password" inputmode="numeric" autocomplete="new-password" maxlength="6" required>' +
+      '<button class="btn" id="sb">Save PIN</button><div id="serr" class="err"></div></form><button class="btn sec" id="slo">Log out</button></div>';
+    $('#slo').onclick = () => logout();
+    $('#sf').onsubmit = async (e) => {
+      e.preventDefault(); const b = $('#sb'); $('#serr').textContent = '';
+      if (!/^\d{6}$/.test($('#sn').value)) { $('#serr').textContent = 'PIN must be exactly 6 digits'; return; }
+      if ($('#sn').value !== $('#sn2').value) { $('#serr').textContent = 'The two new PINs are not the same'; return; }
+      b.disabled = true; b.textContent = 'Saving…';
+      try {
+        await api('changePin', { oldPin: $('#so').value, newPin: $('#sn').value });
+        state.user.mustChangePin = false; store.set('user', state.user); toast('PIN saved');
+        location.hash = isStaff() ? '#/dashboard' : '#/accounts';
+      } catch (err) { $('#serr').textContent = err.message; b.disabled = false; b.textContent = 'Save PIN'; }
     };
   }
 
@@ -241,7 +292,7 @@
       });
       view.querySelectorAll('[data-void]').forEach((b) => b.onclick = () => {
         const e = L.entries[+b.dataset.void];
-        const payload = e.receipt ? { tab: 'Receive', receipt: e.receipt } : { tab: 'Receive', row: e.row, mid: L.mid };
+        const payload = e.receipt ? { tab: 'Receive', receipt: e.receipt } : { tab: 'Receive', row: e.row, mid: L.mid, forMonth: e.forMonth, deposit: e.deposit };
         const n = e.receipt ? L.entries.filter((x) => x.receipt === e.receipt).length : 1;
         voidFlow(payload, e.receipt ? 'receipt ' + e.receipt + ' (' + n + ' month' + (n > 1 ? 's' : '') + ')' : e.forMonth + ' entry', () => viewLedger([L.mid]));
       });
@@ -384,7 +435,7 @@
         (state.user.role === 'admin' ? '<button class="btn sm sec" data-void="' + i + '" style="color:var(--red);margin-top:4px">Void</button>' : '') + '</div><div class="amt">' + tk(e.deposit) + '</div></div>').join('') + '</div>';
       view.querySelectorAll('[data-void]').forEach((b) => b.onclick = () => {
         const e = t[+b.dataset.void];
-        voidFlow(e.receipt ? { tab: 'Receive', receipt: e.receipt } : { tab: 'Receive', row: e.row, mid: e.mid }, (e.receipt ? 'receipt ' + e.receipt : e.mid + ' ' + e.forMonth) + ' (' + e.name + ')', viewTx);
+        voidFlow(e.receipt ? { tab: 'Receive', receipt: e.receipt } : { tab: 'Receive', row: e.row, mid: e.mid, forMonth: e.forMonth, deposit: e.deposit }, (e.receipt ? 'receipt ' + e.receipt : e.mid + ' ' + e.forMonth) + ' (' + e.name + ')', viewTx);
       });
     } catch (e) { fail(e); }
   }
@@ -398,7 +449,7 @@
     if (isStaff()) links.push(['#/scdue', '🧮 Service charge due'], ['#/report', '📄 Monthly report']);
     if (admin) links.push(['#/reminders', '🔔 Due reminders'], ['#/health', '🩺 Data check'], ['#/backups', '🗄️ Backups']);
     view.innerHTML = '<h2>' + (isStaff() ? 'More' : 'Settings') + '</h2>' + (links.length ? '<div class="card list">' + links.map(([h, l]) => '<a class="item" href="' + h + '" style="color:inherit;text-decoration:none"><span class="t">' + l + '</span><span class="muted">›</span></a>').join('') + '</div>' : '') +
-      '<div class="card" style="margin-top:16px"><b>Change PIN</b><label>Current PIN</label><input id="op" type="password" inputmode="numeric" maxlength="6"><label>New PIN (4 to 6 digits)</label><input id="np" type="password" inputmode="numeric" maxlength="6"><button class="btn" id="cp">Change PIN</button><div id="cerr" class="err"></div></div>' +
+      '<div class="card" style="margin-top:16px"><b>Change PIN</b><label>Current PIN</label><input id="op" type="password" inputmode="numeric" maxlength="6"><label>New PIN (6 digits)</label><input id="np" type="password" inputmode="numeric" maxlength="6"><button class="btn" id="cp">Change PIN</button><div id="cerr" class="err"></div></div>' +
       '<button class="btn sec" id="lo">Log out</button>' +
       '<p class="muted">To install: open the browser menu and choose “Add to Home screen”.</p>';
     $('#cp').onclick = async () => {
@@ -510,15 +561,17 @@
       view.querySelectorAll('[data-ok],[data-no]').forEach((b) => b.onclick = async () => {
         const ok = !!b.dataset.ok; const id = b.dataset.ok || b.dataset.no;
         if (!confirm((ok ? 'Approve' : 'Reject') + ' this expense?')) return;
-        try { const r = await api('decide', { id, approve: ok }); toast(ok ? 'Approved ' + r.voucher : 'Rejected'); viewExpenses(); } catch (e) { toast(e.message); }
+        view.querySelectorAll('[data-ok],[data-no]').forEach((x) => { x.disabled = true; });
+        try { const r = await api('decide', { id, approve: ok }); toast(ok ? 'Approved ' + r.voucher : 'Rejected'); viewExpenses(); } catch (e) { toast(e.message, 5000); view.querySelectorAll('[data-ok],[data-no]').forEach((x) => { x.disabled = false; }); }
       });
       let fund = 'Somiti';
       view.querySelectorAll('[data-fund]').forEach((b) => b.onclick = () => { fund = b.dataset.fund; view.querySelectorAll('[data-fund]').forEach((x) => x.classList.toggle('on', x === b)); });
       if ($('#esave')) $('#esave').onclick = async () => {
         const amt = Number($('#ea').value || 0);
         if (!confirm('Save ' + tk(amt) + ' Tk expense from the ' + fund + ' fund?')) return;
+        const sb = $('#esave'); sb.disabled = true; sb.textContent = 'Saving…'; $('#eerr').textContent = '';
         try { const r = await api('addExpense', { fund, purpose: $('#ep').value, amount: amt, date: $('#ed').value, paidFrom: $('#ef').value, remarks: $('#er').value }); if (r.pending) alert('Saved for approval. This is a big amount, so a different admin or management member must approve it before it counts.'); else toast('Saved ' + r.voucher); viewExpenses(); }
-        catch (e) { $('#eerr').textContent = e.message; }
+        catch (e) { $('#eerr').textContent = e.message; sb.disabled = false; sb.textContent = 'Save expense'; }
       };
     } catch (e) { fail(e); }
   }
@@ -589,14 +642,22 @@
     const only = args[0] || '';
     busy();
     try {
-      const [list0, money] = await Promise.all([api('scDue'), moneyAccounts()]);
+      const admin = state.user.role === 'admin';
+      const [list0, money, hist0] = await Promise.all([api('scDue'), moneyAccounts(), api('scHistory').catch(() => [])]);
+      const hist = only ? hist0.filter((x) => x.mid === only) : hist0;
       const list = only ? list0.filter((x) => x.mid === only) : list0;
       const total = list0.reduce((t, x) => t + x.amount, 0);
       view.innerHTML = '<a href="' + (only ? '#/ledger/' + esc(only) : '#/more') + '" class="muted">← Back</a><h2>Service charge due</h2>' +
         (!only ? '<div class="card"><div class="muted">Total not yet paid</div><div class="total">' + tk(total) + ' Tk</div><div class="muted">' + list0.length + ' member(s)</div></div>' : '') +
         (can('payments') && list.length ? '<div class="card"><label>Received into</label><select id="sacct">' + moneyOpts(money) + '</select><label>Collected by</label><input id="scb" placeholder="Who received the money"><label>Date</label><input id="sdate" type="date" value="' + today() + '"></div>' : '') +
         '<div class="card">' + (list.map((x) => '<div class="ent"><div><b>' + esc(x.name) + '</b> <span class="muted">' + esc(x.mid) + '</span><div class="muted">' + esc(x.months.join(', ')) + '</div>' +
-          (can('payments') ? '<button class="btn sm" data-col="' + esc(x.mid) + '" style="margin-top:6px">Collect ' + tk(x.amount) + ' Tk</button>' : '') + '</div><div class="amt" style="color:var(--red)">' + tk(x.amount) + '</div></div>').join('') || '<div class="muted">✅ No service charge due</div>') + '</div>';
+          (can('payments') ? '<button class="btn sm" data-col="' + esc(x.mid) + '" style="margin-top:6px">Collect ' + tk(x.amount) + ' Tk</button>' : '') + '</div><div class="amt" style="color:var(--red)">' + tk(x.amount) + '</div></div>').join('') || '<div class="muted">✅ No service charge due</div>') + '</div>' +
+        (hist.length ? '<h3>Collected lately (' + hist.length + ')</h3><div class="card">' + hist.map((x, i) => '<div class="ent"><div><b>' + esc(x.name) + '</b> <span class="muted">' + esc(x.mid) + '</span><div class="muted">' + esc(x.date) + ' · ' + esc(x.receipt) + ' · ' + esc(x.months) + (x.collectedBy ? ' · by ' + esc(x.collectedBy) : '') + '</div>' +
+          (admin ? '<button class="btn sm sec" data-scv="' + i + '" style="color:var(--red);margin-top:6px">Void</button>' : '') + '</div><div class="amt">' + tk(x.amount) + '</div></div>').join('') + '</div>' : '');
+      view.querySelectorAll('[data-scv]').forEach((b) => b.onclick = () => {
+        const x = hist[+b.dataset.scv];
+        voidFlow({ tab: 'SC', receipt: x.receipt }, 'service charge collection ' + x.receipt + ' (' + tk(x.amount) + ' Tk, ' + x.name + ').\nThose months will show as service charge due again', () => viewScDue(args));
+      });
       view.querySelectorAll('[data-col]').forEach((b) => b.onclick = async () => {
         const x = list.find((y) => y.mid === b.dataset.col);
         if (!confirm('Collect ' + tk(x.amount) + ' Tk service charge from ' + x.mid + ' (' + x.name + ') for ' + x.months.length + ' month(s)?')) return;

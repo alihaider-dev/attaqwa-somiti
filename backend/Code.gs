@@ -23,10 +23,11 @@ const CFG = {
   SESSION_SECONDS: 6 * 60 * 60,
   MAX_TRIES: 5,
   LOCK_MINUTES: 15,
+  LOCK_MAX_MINUTES: 24 * 60,
   HASH_ROUNDS: 200
 };
 
-const USER_COLS = ['UserID', 'Name', 'Phone', 'Role', 'Perms', 'PINHash', 'Salt', 'Status', 'FailedTries', 'LockedUntil', 'LastLogin'];
+const USER_COLS = ['UserID', 'Name', 'Phone', 'Role', 'Perms', 'PINHash', 'Salt', 'Status', 'FailedTries', 'LockedUntil', 'LastLogin', 'LockCount', 'MustChangePin'];
 const ACCT_COLS = ['MID', 'AccountName', 'HolderUserID', 'LinkedAt', 'LinkedBy', 'Reason'];
 const RECEIVE_EXTRA = ['Receipt No', 'Collected By', 'Entered At', 'Entered By', 'Account', 'Donor ID', 'SC Paid Later']; // Receive H:N
 const SCC_COLS = ['Date', 'MID', 'Name', 'Months', 'Amount', 'Account', 'Collected By', 'Receipt', 'Entered At', 'Entered By'];
@@ -188,6 +189,7 @@ function setup() {
   // New header cells to the RIGHT of existing columns (only where empty). Existing data untouched.
   ensureHeaders_(sh_(CFG.TABS.RECEIVE), 8, RECEIVE_EXTRA);
   ensureHeaders_(sh_(CFG.TABS.EXP), 6, EXP_EXTRA);
+  ensureHeaders_(sh_(CFG.TABS.USERS), 12, ['LockCount', 'MustChangePin']);
 
   // Accounts + users: one per Member ID, each is its own Account Holder at first.
   const users = rowsAsObjects_(CFG.TABS.USERS, USER_COLS);
@@ -199,7 +201,7 @@ function setup() {
   Object.keys(info).forEach(mid => {
     if (mid === CFG.MOSJID_ID) return;
     if (!haveA.has(mid)) newA.push([mid, info[mid].name, mid, new Date(), 'setup', 'initial import']);
-    if (!haveU.has(mid)) newU.push([mid, info[mid].name, info[mid].phone, 'member', '', '', '', 'active', 0, '', '']);
+    if (!haveU.has(mid)) newU.push([mid, info[mid].name, info[mid].phone, 'member', '', '', '', 'active', 0, '', '', 0, '']);
   });
   if (newA.length) sh_(CFG.TABS.ACCTS).getRange(sh_(CFG.TABS.ACCTS).getLastRow() + 1, 1, newA.length, ACCT_COLS.length).setValues(newA);
   if (newU.length) sh_(CFG.TABS.USERS).getRange(sh_(CFG.TABS.USERS).getLastRow() + 1, 1, newU.length, USER_COLS.length).setValues(newU);
@@ -223,7 +225,7 @@ function addStaff_(userId, name, phone, role, perms, pin) {
   const users = rowsAsObjects_(CFG.TABS.USERS, USER_COLS);
   if (users.some(u => u.UserID === userId)) throw new Error('User exists: ' + userId);
   const salt = Utilities.getUuid();
-  sh_(CFG.TABS.USERS).appendRow([userId, name, phone, role, perms || '', hash_(pin, salt), salt, 'active', 0, '', '']); bust_();
+  sh_(CFG.TABS.USERS).appendRow([userId, name, phone, role, perms || '', hash_(pin, salt), salt, 'active', 0, '', '', 0, 'YES']); bust_();
   audit_(null, 'add_staff', { userId, role });
 }
 
@@ -236,7 +238,11 @@ function hash_(pin, salt) {
   }
   return h;
 }
-function newPin_() { return String(Math.floor(100000 + Math.random() * 900000)); }
+function newPin_() {
+  // Random source is a fresh UUID (secure random), not Math.random.
+  const n = parseInt(Utilities.getUuid().replace(/-/g, '').slice(0, 12), 16);
+  return String(100000 + (n % 900000));
+}
 
 function session_(token) {
   if (!token) throw authErr_();
@@ -316,16 +322,41 @@ function doPost(e) {
         dataHealth: () => { requireAdmin_(u); return dataHealth_(); },
         setUserPhone: () => { requireAdmin_(u); return setUserPhone_(u, b.userId, b.phone); },
         scDue: () => { if (!isStaff_(u)) throw new Error('Not allowed'); return scDueList_(); },
-        collectSc: () => collectSc_(u, b)
+        collectSc: () => collectSc_(u, b),
+        scHistory: () => { if (!isStaff_(u)) throw new Error('Not allowed'); return scHistory_(30); }
       };
       if (!routes[action]) throw new Error('Unknown action');
-      out = routes[action]();
+      if (publicUser_(u).mustChangePin && ['me', 'logout', 'changePin'].indexOf(action) < 0) { const e2 = new Error('Set your own PIN first'); e2.code = 'PIN'; throw e2; }
+      out = once_(u, action, b.rid, routes[action]);
     }
     out = { ok: true, data: out };
   } catch (err) {
     out = { ok: false, error: String(err.message || err), code: err.code || '' };
   }
   return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+}
+
+/* ---------------- one-time save ID (stops double saves) ---------------- */
+const ONCE_ACTIONS = ['addPayment', 'addMosjid', 'addExpense', 'addCash', 'reconcile', 'collectSc', 'decide', 'closeAccount', 'voidEntry', 'addMember'];
+/**
+ * The app sends the same rid when it retries a save it got no answer for.
+ * First time: run it and remember the answer for 6 hours. Same rid again: give back the remembered answer, save nothing.
+ */
+function once_(u, action, rid, fn) {
+  rid = String(rid || '');
+  if (ONCE_ACTIONS.indexOf(action) < 0 || !rid) return fn();
+  const cache = CacheService.getScriptCache();
+  const key = 'r_' + Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, u.UserID + '|' + action + '|' + rid)).slice(0, 40);
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error('Another save is running. Try again in a moment.');
+  let prev;
+  try { prev = cache.get(key); if (!prev) cache.put(key, 'RUNNING', 360); } finally { lock.releaseLock(); }
+  if (prev === 'RUNNING') throw new Error('This save is still running. Wait a moment, then check Activity before trying again.');
+  if (prev) { const r = JSON.parse(prev); if (r && typeof r === 'object') r.repeat = true; return r; }
+  let out;
+  try { out = fn(); } catch (e) { cache.remove(key); throw e; }
+  try { cache.put(key, JSON.stringify(out), 21600); } catch (e) { /* too big to remember: fine */ }
+  return out;
 }
 
 /* ---------------- auth actions ---------------- */
@@ -337,27 +368,34 @@ function login_(b) {
   const fail = 'Wrong ID or PIN';
   if (!u || u.Status !== 'active' || !u.PINHash) throw new Error(fail);
   const now = new Date();
-  if (u.LockedUntil && new Date(u.LockedUntil) > now) throw new Error('Too many tries. Try again after ' + Utilities.formatDate(new Date(u.LockedUntil), tz_(), 'h:mm a'));
+  if (u.LockedUntil && new Date(u.LockedUntil) > now) throw new Error('Too many tries. Try again after ' + Utilities.formatDate(new Date(u.LockedUntil), tz_(), 'd-MMM h:mm a'));
   if (hash_(pin, u.Salt) !== u.PINHash) {
     u.FailedTries = num_(u.FailedTries) + 1;
-    if (u.FailedTries >= CFG.MAX_TRIES) { u.LockedUntil = new Date(now.getTime() + CFG.LOCK_MINUTES * 60000); u.FailedTries = 0; }
+    if (u.FailedTries >= CFG.MAX_TRIES) {
+      // Each lock is twice as long as the one before (15 min, 30 min, 1 h ... up to 24 h). A correct login resets it.
+      const n = num_(u.LockCount);
+      const mins = Math.min(CFG.LOCK_MAX_MINUTES, CFG.LOCK_MINUTES * Math.pow(2, Math.min(n, 10)));
+      u.LockedUntil = new Date(now.getTime() + mins * 60000); u.FailedTries = 0; u.LockCount = n + 1;
+    }
     setCells_(CFG.TABS.USERS, u._row, USER_COLS, u);
     throw new Error(fail);
   }
-  u.FailedTries = 0; u.LockedUntil = ''; u.LastLogin = now;
+  u.FailedTries = 0; u.LockedUntil = ''; u.LockCount = 0; u.LastLogin = now;
   setCells_(CFG.TABS.USERS, u._row, USER_COLS, u);
   const token = Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '');
   CacheService.getScriptCache().put('s_' + token, u.UserID, CFG.SESSION_SECONDS);
   audit_(u, 'login', '');
   return { token, user: publicUser_(u) };
 }
-function publicUser_(u) { return { id: u.UserID, name: u.Name, role: u.Role, perms: String(u.Perms || '').split(',').filter(Boolean) }; }
+function publicUser_(u) { return { id: u.UserID, name: u.Name, role: u.Role, perms: String(u.Perms || '').split(',').filter(Boolean), mustChangePin: String(u.MustChangePin || '').toUpperCase() === 'YES' }; }
 function me_(u) { return { user: publicUser_(u), settings: getSettings_() }; }
 function changePin_(u, b) {
   if (hash_(String(b.oldPin || ''), u.Salt) !== u.PINHash) throw new Error('Old PIN is wrong');
   const np = String(b.newPin || '');
-  if (!/^\d{4,6}$/.test(np)) throw new Error('PIN must be 4 to 6 digits');
-  u.Salt = Utilities.getUuid(); u.PINHash = hash_(np, u.Salt);
+  if (!/^\d{6}$/.test(np)) throw new Error('PIN must be exactly 6 digits');
+  if (/^(\d)\1{5}$/.test(np) || np === '123456' || np === '654321') throw new Error('This PIN is too easy to guess. Choose another.');
+  if (np === String(b.oldPin || '')) throw new Error('New PIN must be different from the old one');
+  u.Salt = Utilities.getUuid(); u.PINHash = hash_(np, u.Salt); u.MustChangePin = '';
   setCells_(CFG.TABS.USERS, u._row, USER_COLS, u);
   audit_(u, 'change_pin', '');
   return true;
@@ -629,7 +667,7 @@ function sendSms_(to, phone, msg) {
   else {
     try {
       const p = props_();
-      const url = 'http://bulksmsbd.net/api/smsapi?api_key=' + encodeURIComponent(p.getProperty('BULKSMS_API_KEY') || '') +
+      const url = 'https://bulksmsbd.net/api/smsapi?api_key=' + encodeURIComponent(p.getProperty('BULKSMS_API_KEY') || '') +
         '&type=text&number=' + num + '&senderid=' + encodeURIComponent(p.getProperty('BULKSMS_SENDER_ID') || '') +
         '&message=' + encodeURIComponent(msg);
       const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
@@ -655,7 +693,7 @@ function resetPin_(admin, userId, sendSms) {
   if (!u) throw new Error('Unknown user');
   if (u.Status !== 'active') throw new Error('This ID has no login (linked under another Account Holder)');
   const pin = newPin_();
-  u.Salt = Utilities.getUuid(); u.PINHash = hash_(pin, u.Salt); u.FailedTries = 0; u.LockedUntil = '';
+  u.Salt = Utilities.getUuid(); u.PINHash = hash_(pin, u.Salt); u.FailedTries = 0; u.LockedUntil = ''; u.LockCount = 0; u.MustChangePin = 'YES';
   setCells_(CFG.TABS.USERS, u._row, USER_COLS, u);
   audit_(admin, 'reset_pin', { userId });
   const msg = (getSettings_().SOMITI_NAME || 'At-Taqwa Somiti') + ' app login. ID: ' + userId + ' PIN: ' + pin + '. Change it after login.';
@@ -780,7 +818,7 @@ function addMember_(admin, b) {
     }
     bust_();
     sh_(CFG.TABS.ACCTS).appendRow([mid, f.name, holder || mid, now, admin.UserID, holder ? 'new share account under ' + holder : 'new member']);
-    sh_(CFG.TABS.USERS).appendRow([mid, f.name, f.phone || '', 'member', '', '', '', holder ? 'linked' : 'active', 0, '', '']);
+    sh_(CFG.TABS.USERS).appendRow([mid, f.name, f.phone || '', 'member', '', '', '', holder ? 'linked' : 'active', 0, '', '', 0, '']);
     audit_(admin, 'add_member', { mid, name: f.name, holder: holder || mid });
     markDirty_();
   } finally { lock.releaseLock(); }
@@ -840,8 +878,18 @@ function addExpense_(u, b) {
 function writeExpense_(u, data, approvedBy) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) throw new Error('Another save is running. Try again in a moment.');
+  let r;
+  try { r = writeExpenseLocked_(u, data, approvedBy); } finally { lock.releaseLock(); }
+  expenseAlert_(r, data);
+  return r;
+}
+function expenseAlert_(r, data) {
+  if (data.amount >= (num_(getSettings_().ALERT_OVER) || Infinity)) alert_('Expense ' + r.voucher + ': ' + data.amount.toLocaleString('en-US') + ' Tk, ' + data.purpose + ' (' + data.fund + ', from ' + data.paidFrom + ').');
+}
+/** Caller must hold the script lock. */
+function writeExpenseLocked_(u, data, approvedBy) {
   let voucher;
-  try {
+  {
     const s = sh_(CFG.TABS.EXP);
     const row = lastFilledRow_(s, 3) + 1;
     voucher = nextReceipt_().replace(/^[A-Z]+/, 'EXP');
@@ -851,8 +899,7 @@ function writeExpense_(u, data, approvedBy) {
     if (num_(s.getRange(row, 3).getValue()) !== data.amount) throw new Error('Save check failed. Check the Expenses tab.');
     audit_(u, 'add_expense', { voucher, amount: data.amount, fund: data.fund, acct: data.paidFrom, purpose: data.purpose, approvedBy });
     markDirty_();
-  } finally { lock.releaseLock(); }
-  if (data.amount >= (num_(getSettings_().ALERT_OVER) || Infinity)) alert_('Expense ' + voucher + ': ' + data.amount.toLocaleString('en-US') + ' Tk, ' + data.purpose + ' (' + data.fund + ', from ' + data.paidFrom + ').');
+  }
   return { voucher, amount: data.amount, fund: data.fund, paidFrom: data.paidFrom };
 }
 
@@ -1089,6 +1136,7 @@ function alert_(text) {
  */
 function voidEntry_(u, b) {
   const reason = String(b.reason || '').trim(); if (!reason) throw new Error('Reason is required');
+  if (b.tab === 'SC') return voidScCollection_(u, String(b.receipt || '').trim(), reason);
   const tab = b.tab === 'Expenses' ? CFG.TABS.EXP : CFG.TABS.RECEIVE;
   const width = tab === CFG.TABS.EXP ? 9 : 14;
   const lock = LockService.getScriptLock();
@@ -1104,7 +1152,8 @@ function voidEntry_(u, b) {
     else if (b.row) {
       const r = v[Number(b.row) - 2];
       if (!r) throw new Error('Row not found');
-      if (tab === CFG.TABS.RECEIVE && String(r[2]).trim() !== String(b.mid || '').trim()) throw new Error('Row changed since you opened it. Refresh and try again.');
+      // The row must still be the SAME entry: same member, same month, same deposit. (Row numbers move when rows above are voided.)
+      if (tab === CFG.TABS.RECEIVE && (String(r[2]).trim() !== String(b.mid || '').trim() || fmtMonth_(toDate_(r[1])) !== String(b.forMonth || '') || num_(r[4]) !== num_(b.deposit))) throw new Error('Row changed since you opened it. Refresh and try again.');
       if (tab === CFG.TABS.EXP && num_(r[2]) !== num_(b.amount)) throw new Error('Row changed since you opened it. Refresh and try again.');
       rows = [Number(b.row)];
     }
@@ -1113,16 +1162,89 @@ function voidEntry_(u, b) {
     const copies = rows.map(rn => { const r = v[rn - 2]; const amt = tab === CFG.TABS.EXP ? num_(r[2]) : num_(r[4]) + num_(r[5]); total += amt;
       return [now, u.UserID, reason, tab, String(r[keyCol] || ''), tab === CFG.TABS.EXP ? '' : String(r[2]), amt, JSON.stringify(r)]; });
     bust_();
+    let scUndone = 0;
+    if (tab === CFG.TABS.RECEIVE) {
+      // 1) These rows had their service charge collected LATER (column N): take those months out of the collection record.
+      const later = rows.map(rn => v[rn - 2]).filter(r => String(r[13] || '').trim() && num_(r[5]) > 0)
+        .map(r => ({ mid: String(r[2]).trim(), month: fmtMonth_(toDate_(r[1])), sc: num_(r[5]), scReceipt: String(r[13]).trim() }));
+      scShrinkCollections_(later, now, u, reason).forEach(c => copies.push(c));
+      // 2) This receipt also collected OLD service charge from earlier months: undo that too.
+      if (b.receipt) { const un = scUndoReceipt_(s, v, String(b.receipt).trim(), rows, now, u, reason); un.copies.forEach(c => copies.push(c)); scUndone = un.total; total += un.total; }
+    }
     const vs = sh_(CFG.TABS.VOID);
     vs.getRange(vs.getLastRow() + 1, 1, copies.length, VOID_COLS.length).setValues(copies);
     rows.sort((a, b2) => b2 - a).forEach(rn => s.deleteRow(rn)); // bottom-up so row numbers stay valid
     SpreadsheetApp.flush();
-    out = { voided: rows.length, total, tab, receipt: b.receipt || '' };
+    out = { voided: rows.length, total, tab, receipt: b.receipt || '', scUndone };
     audit_(u, 'void', Object.assign({ reason }, out));
     markDirty_();
   } finally { lock.releaseLock(); }
   alert_('VOID by ' + u.UserID + ': ' + out.voided + ' row(s), ' + out.total.toLocaleString('en-US') + ' Tk in ' + out.tab + '. Reason: ' + reason);
   return out;
+}
+
+/* ---- service charge collections and void (all callers hold the script lock) ---- */
+/** Rows being voided had SC collected later: remove those months (and their money) from App_SC_Collections. Returns App_Voided copies. */
+function scShrinkCollections_(items, now, u, reason) {
+  if (!items.length) return [];
+  const s = sh_(CFG.TABS.SCC); const last = s.getLastRow();
+  if (last < 2) return [];
+  const v = s.getRange(2, 1, last - 1, SCC_COLS.length).getValues();
+  const copies = []; const touched = {};
+  items.forEach(it => {
+    const i = v.findIndex(r => String(r[7]).trim() === it.scReceipt && String(r[1]).trim() === it.mid && String(r[3]).split(',').map(x => x.trim()).indexOf(it.month) >= 0);
+    if (i < 0) return;
+    const months = String(v[i][3]).split(',').map(x => x.trim()).filter(Boolean); months.splice(months.indexOf(it.month), 1);
+    v[i][3] = months.join(', '); v[i][4] = Math.max(0, num_(v[i][4]) - it.sc); touched[i] = true;
+    copies.push([now, u.UserID, reason, CFG.TABS.SCC, it.scReceipt, it.mid, it.sc, JSON.stringify({ month: it.month, note: 'late service charge removed because its payment was voided' })]);
+  });
+  const del = [];
+  Object.keys(touched).map(Number).forEach(i => { if (!v[i][3] || num_(v[i][4]) <= 0) del.push(i + 2); else s.getRange(i + 2, 4, 1, 2).setValues([[v[i][3], v[i][4]]]); });
+  del.sort((a, b) => b - a).forEach(rn => s.deleteRow(rn));
+  return copies;
+}
+/**
+ * Undo every service charge collection saved under this receipt: the months go back to "service charge due".
+ * recv/v = Receive sheet and its values from row 2. skipRows = Receive rows that are being deleted anyway.
+ */
+function scUndoReceipt_(recv, v, receipt, skipRows, now, u, reason) {
+  const s = sh_(CFG.TABS.SCC); const last = s.getLastRow();
+  const out = { copies: [], total: 0, months: 0 };
+  if (last < 2 || !receipt) return out;
+  const sv = s.getRange(2, 1, last - 1, SCC_COLS.length).getValues();
+  const del = [];
+  sv.forEach((r, i) => { if (String(r[7]).trim() === receipt) { del.push(i + 2); out.total += num_(r[4]); out.copies.push([now, u.UserID, reason, CFG.TABS.SCC, receipt, String(r[1]), num_(r[4]), JSON.stringify(r)]); } });
+  if (!del.length) return out;
+  const skip = {}; (skipRows || []).forEach(rn => skip[rn] = true);
+  v.forEach((r, i) => { const rn = i + 2; if (!skip[rn] && String(r[13] || '').trim() === receipt) { recv.getRange(rn, 6).setValue(0); recv.getRange(rn, 14).setValue(''); out.months++; } });
+  del.sort((a, b) => b - a).forEach(rn => s.deleteRow(rn));
+  return out;
+}
+/** Admin: void one service charge collection by its receipt number. */
+function voidScCollection_(u, receipt, reason) {
+  if (!receipt) throw new Error('Entry not found');
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error('Another save is running. Try again in a moment.');
+  let out;
+  try {
+    bust_();
+    const recv = sh_(CFG.TABS.RECEIVE); const last = lastFilledRow_(recv, 3);
+    const v = last >= 2 ? recv.getRange(2, 1, last - 1, 14).getValues() : [];
+    const un = scUndoReceipt_(recv, v, receipt, [], new Date(), u, reason);
+    if (!un.copies.length) throw new Error('Entry not found');
+    const vs = sh_(CFG.TABS.VOID);
+    vs.getRange(vs.getLastRow() + 1, 1, un.copies.length, VOID_COLS.length).setValues(un.copies);
+    SpreadsheetApp.flush();
+    out = { voided: un.copies.length, total: un.total, tab: CFG.TABS.SCC, receipt, months: un.months };
+    audit_(u, 'void', Object.assign({ reason }, out));
+    markDirty_();
+  } finally { lock.releaseLock(); }
+  alert_('VOID by ' + u.UserID + ': service charge collection ' + receipt + ', ' + out.total.toLocaleString('en-US') + ' Tk. Reason: ' + reason);
+  return out;
+}
+function scHistory_(limit) {
+  return rowsAsObjects_(CFG.TABS.SCC, SCC_COLS).map(r => ({ date: fmtDate_(toDate_(r.Date)), mid: r.MID, name: r.Name, months: String(r.Months || ''), amount: num_(r.Amount), account: r.Account, collectedBy: r['Collected By'], receipt: String(r.Receipt || '') }))
+    .reverse().slice(0, limit || 30);
 }
 
 /* ---------------- member exit / withdrawal ---------------- */
@@ -1208,14 +1330,21 @@ function listPending_() {
 }
 function decidePending_(u, id, approve, note) {
   if (!can_(u, 'expenses')) throw new Error('Not allowed');
-  const p = rowsAsObjects_(CFG.TABS.PENDING, PENDING_COLS).find(x => x.ID === id);
-  if (!p || p.Status !== 'pending') throw new Error('Already decided or not found');
-  if (p['Created By'] === u.UserID) throw new Error('A different person must approve this');
-  let res = null;
-  if (approve) res = writeExpense_({ UserID: p['Created By'] }, JSON.parse(p.Data), u.UserID);
-  p.Status = approve ? 'approved' : 'rejected'; p['Decided By'] = u.UserID; p['Decided At'] = new Date(); p.Note = String(note || '') + (res ? ' ' + res.voucher : '');
-  setCells_(CFG.TABS.PENDING, p._row, PENDING_COLS, p);
-  audit_(u, approve ? 'approve_expense' : 'reject_expense', { id });
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error('Another save is running. Try again in a moment.');
+  let p, res = null, data = null;
+  try {
+    bust_(); // read the newest status INSIDE the lock, so two quick taps cannot both approve
+    p = rowsAsObjects_(CFG.TABS.PENDING, PENDING_COLS).find(x => x.ID === id);
+    if (!p || p.Status !== 'pending') throw new Error('Already decided or not found');
+    if (p['Created By'] === u.UserID) throw new Error('A different person must approve this');
+    if (approve) { data = JSON.parse(p.Data); res = writeExpenseLocked_({ UserID: p['Created By'] }, data, u.UserID); }
+    p.Status = approve ? 'approved' : 'rejected'; p['Decided By'] = u.UserID; p['Decided At'] = new Date(); p.Note = String(note || '') + (res ? ' ' + res.voucher : '');
+    setCells_(CFG.TABS.PENDING, p._row, PENDING_COLS, p);
+    SpreadsheetApp.flush();
+    audit_(u, approve ? 'approve_expense' : 'reject_expense', { id });
+  } finally { lock.releaseLock(); }
+  if (res) expenseAlert_(res, data);
   return { id, status: p.Status, voucher: res ? res.voucher : '' };
 }
 
