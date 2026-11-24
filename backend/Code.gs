@@ -17,7 +17,7 @@ const CFG = {
     DASH: 'Dashboard', RECEIVE: 'Receive', INFO: 'INFORMATION', EXP: 'Expenses',
     USERS: 'App_Users', ACCTS: 'App_Accounts', AUDIT: 'App_Audit_Log',
     SMS: 'App_SMS_Log', SETTINGS: 'App_Settings', CASH: 'App_Cashbook', RECON: 'App_Reconcile',
-    VOID: 'App_Voided', PENDING: 'App_Pending', DOCS: 'App_Documents', PAYIN: 'Payment Entry'
+    VOID: 'App_Voided', PENDING: 'App_Pending', DOCS: 'App_Documents', PAYIN: 'Payment Entry', SCC: 'App_SC_Collections'
   },
   MOSJID_ID: 'ATFS-0000',
   SESSION_SECONDS: 6 * 60 * 60,
@@ -28,7 +28,8 @@ const CFG = {
 
 const USER_COLS = ['UserID', 'Name', 'Phone', 'Role', 'Perms', 'PINHash', 'Salt', 'Status', 'FailedTries', 'LockedUntil', 'LastLogin'];
 const ACCT_COLS = ['MID', 'AccountName', 'HolderUserID', 'LinkedAt', 'LinkedBy', 'Reason'];
-const RECEIVE_EXTRA = ['Receipt No', 'Collected By', 'Entered At', 'Entered By', 'Account', 'Donor ID']; // Receive H:M
+const RECEIVE_EXTRA = ['Receipt No', 'Collected By', 'Entered At', 'Entered By', 'Account', 'Donor ID', 'SC Paid Later']; // Receive H:N
+const SCC_COLS = ['Date', 'MID', 'Name', 'Months', 'Amount', 'Account', 'Collected By', 'Receipt', 'Entered At', 'Entered By'];
 const EXP_EXTRA = ['Paid From', 'Voucher No', 'Entered At', 'Entered By']; // Expenses F:I
 const CASH_COLS = ['Date', 'Type', 'From', 'To', 'Amount', 'Note', 'Ref', 'Entered At', 'Entered By'];
 const RECON_COLS = ['Date', 'Account', 'Statement Balance', 'App Balance', 'Difference', 'Note', 'Entered At', 'Entered By'];
@@ -178,6 +179,7 @@ function setup() {
   ensure(CFG.TABS.VOID, VOID_COLS);
   ensure(CFG.TABS.PENDING, PENDING_COLS);
   ensure(CFG.TABS.DOCS, DOC_COLS);
+  ensure(CFG.TABS.SCC, SCC_COLS);
   const st = ensure(CFG.TABS.SETTINGS, ['Key', 'Value', 'Note']);
   const haveKeys = new Set(st.getDataRange().getValues().map(r => String(r[0]).trim()));
   const addKeys = DEFAULT_SETTINGS.filter(r => !haveKeys.has(r[0]));
@@ -312,7 +314,9 @@ function doPost(e) {
         doc: () => getDoc_(u, b.fileId),
         uploadDoc: () => { requireAdmin_(u); return uploadDoc_(u, b); },
         dataHealth: () => { requireAdmin_(u); return dataHealth_(); },
-        setUserPhone: () => { requireAdmin_(u); return setUserPhone_(u, b.userId, b.phone); }
+        setUserPhone: () => { requireAdmin_(u); return setUserPhone_(u, b.userId, b.phone); },
+        scDue: () => { if (!isStaff_(u)) throw new Error('Not allowed'); return scDueList_(); },
+        collectSc: () => collectSc_(u, b)
       };
       if (!routes[action]) throw new Error('Unknown action');
       out = routes[action]();
@@ -420,7 +424,8 @@ function accounts_(u) {
   const holderOf = {}; accts.forEach(a => holderOf[a.MID] = a.HolderUserID);
   const mine = isStaff_(u) ? null : new Set(myMids_(u));
   const lim = num_(getSettings_().INACTIVE_AFTER_MONTHS) || 6;
-  return dash.filter(m => !mine || mine.has(m.mid)).map(m => Object.assign({ holder: holderOf[m.mid] || '', inactive: dueMonths_(m.status) >= lim }, m));
+  const sc = scDueMap_();
+  return dash.filter(m => !mine || mine.has(m.mid)).map(m => Object.assign({ holder: holderOf[m.mid] || '', inactive: dueMonths_(m.status) >= lim, scOwed: sc[m.mid] ? sc[m.mid].amount : 0, scMonths: sc[m.mid] ? sc[m.mid].months.length : 0 }, m));
 }
 
 function dueMonths_(status) { const m = String(status || '').match(/^(\d+)\s*Due/i); return m ? Number(m[1]) : 0; }
@@ -430,11 +435,11 @@ function receiveRowsRead_() {
   const s = sh_(CFG.TABS.RECEIVE);
   const last = lastFilledRow_(s, 3);
   if (last < 2) return [];
-  const v = s.getRange(2, 1, last - 1, 13).getValues();
+  const v = s.getRange(2, 1, last - 1, 14).getValues();
   return v.map((r, i) => ({
     row: i + 2, date: toDate_(r[0]), forMonth: toDate_(r[1]), mid: String(r[2]).trim(), name: r[3],
     deposit: num_(r[4]), sc: num_(r[5]), remarks: String(r[6] || ''), receipt: String(r[7] || ''), collectedBy: String(r[8] || ''),
-    account: String(r[11] || '').trim(), donorId: String(r[12] || '').trim()
+    account: String(r[11] || '').trim(), donorId: String(r[12] || '').trim(), scLater: String(r[13] || '').trim()
   })).filter(x => x.mid);
 }
 
@@ -448,7 +453,8 @@ function ledger_(u, mid) {
   return {
     mid, name: info.name, phone: isStaff_(u) ? info.phone : '', summary,
     entries: rows.map(r => ({ row: r.row, date: fmtDate_(r.date), forMonth: fmtMonth_(r.forMonth), deposit: r.deposit, sc: r.sc, remarks: r.remarks, receipt: r.receipt, collectedBy: r.collectedBy })),
-    donations: don.map(r => ({ date: fmtDate_(r.date), amount: r.deposit, receipt: r.receipt }))
+    donations: don.map(r => ({ date: fmtDate_(r.date), amount: r.deposit, receipt: r.receipt })),
+    scOwed: (scDueMap_()[mid] || { amount: 0 }).amount
   };
 }
 
@@ -487,7 +493,7 @@ function preview_(mid, count) {
   const sc = num_(getSettings_().SERVICE_CHARGE_PER_MONTH);
   const dep = monthlyDeposit_();
   const nm = nextMonths_(mid, count);
-  return { mid, name: info.name, lastPaid: nm.lastPaid ? fmtMonth_(nm.lastPaid) : 'none', months: nm.months.map(fmtMonth_), deposit: dep, sc, total: (dep + sc) * count };
+  return { mid, name: info.name, lastPaid: nm.lastPaid ? fmtMonth_(nm.lastPaid) : 'none', months: nm.months.map(fmtMonth_), deposit: dep, sc, total: (dep + sc) * count, scOwed: (scDueMap_()[mid] || { amount: 0 }).amount };
 }
 
 function nextReceipt_() {
@@ -501,8 +507,8 @@ function nextReceipt_() {
 function writeReceive_(rows) {
   const s = sh_(CFG.TABS.RECEIVE);
   const start = lastFilledRow_(s, 3) + 1;
-  rows = rows.map(r => { const x = r.slice(); while (x.length < 13) x.push(''); x[0] = dateOut_(x[0]); x[1] = dateOut_(x[1]); return x; });
-  s.getRange(start, 1, rows.length, 13).setValues(rows);
+  rows = rows.map(r => { const x = r.slice(); while (x.length < 14) x.push(''); x[0] = dateOut_(x[0]); x[1] = dateOut_(x[1]); return x; });
+  s.getRange(start, 1, rows.length, 14).setValues(rows);
   SpreadsheetApp.flush();
   // Verify every row landed (fixes the "vanished entry" problem: we never report success unless it's really there).
   const back = s.getRange(start, 3, rows.length, 1).getValues();
@@ -523,7 +529,8 @@ function addPayment_(u, b) {
   if (!lock.tryLock(30000)) throw new Error('Another save is running. Try again in a moment.');
   let result;
   try {
-    const sc = num_(getSettings_().SERVICE_CHARGE_PER_MONTH);
+    const scRate = num_(getSettings_().SERVICE_CHARGE_PER_MONTH);
+    const sc = b.scPaid === false ? 0 : scRate; // member may pay the service charge later
     const dep = monthlyDeposit_();
     const nm = nextMonths_(mid, count); // re-check inside the lock
     if (b.expectFirst && fmtMonth_(nm.months[0]) !== b.expectFirst) throw new Error('Months changed since preview (someone else saved). Please preview again.');
@@ -532,14 +539,20 @@ function addPayment_(u, b) {
     const acct = checkAccount_(b.account);
     const rows = nm.months.map(m => [depDate, m, mid, info.name, dep, sc, String(b.remarks || ''), receipt, String(b.collectedBy || ''), now, u.UserID, acct, '']);
     const at = writeReceive_(rows);
-    result = { receipt, mid, name: info.name, months: nm.months.map(fmtMonth_), total: (dep + sc) * count, row: at };
+    result = { receipt, mid, name: info.name, months: nm.months.map(fmtMonth_), total: (dep + sc) * count, row: at, scSkipped: sc === 0 && scRate > 0 };
+    if (b.collectOldSc) {
+      const old = scCollectLocked_(u, mid, { account: acct, collectedBy: b.collectedBy, date: depDate, receipt, excludeFrom: at });
+      result.oldSc = old.amount; result.total += old.amount;
+    }
     audit_(u, 'add_payment', result);
   } finally { lock.releaseLock(); }
   if (b.sendSms !== false && String(getSettings_().SMS_ON_PAYMENT).toUpperCase() === 'YES') {
     const m = result.months;
     const period = m.length === 1 ? m[0] : m[0] + ' to ' + m[m.length - 1];
+    const owedNow = (scDueMap_()[mid] || { amount: 0 }).amount;
     const msg = (getSettings_().SOMITI_NAME || 'At-Taqwa Somiti') + ': ' + result.mid + ' (' + result.name + ') ' +
-      (result.total).toLocaleString('en-US') + ' Tk received for ' + period + '. Paid up to ' + m[m.length - 1] + '. Receipt ' + result.receipt;
+      (result.total).toLocaleString('en-US') + ' Tk received for ' + period + (result.oldSc ? ' + old service charge' : '') + '. Paid up to ' + m[m.length - 1] + '.' +
+      (owedNow ? ' Service charge due: ' + owedNow.toLocaleString('en-US') + ' Tk.' : '') + ' Receipt ' + result.receipt;
     const s = smsToHolder_(mid, msg);
     result.sms = s.sms; result.wa = s.wa; result.waOnly = s.waOnly;
   }
@@ -871,9 +884,14 @@ function cashbook_() {
   const label = {};
   receiveRows_().forEach(r => {
     if (r.date && r.date >= start) {
-      const v = r.deposit + r.sc; const a = r.account || accts[0]; add(a, v); inflow += v;
+      const v = r.deposit + (r.scLater ? 0 : r.sc); const a = r.account || accts[0]; add(a, v); inflow += v;
       if (a === accts[0] && key(r.collectedBy)) { const k = key(r.collectedBy); held[k] = (held[k] || 0) + v; label[k] = label[k] || r.collectedBy.trim(); }
     }
+  });
+  rowsAsObjects_(CFG.TABS.SCC, SCC_COLS).forEach(r => {
+    const d = toDate_(r.Date); if (!d || d < start) return;
+    const v = num_(r.Amount); const a = r.Account || accts[0]; add(a, v); inflow += v;
+    const k = key(r['Collected By']); if (a === accts[0] && k) { held[k] = (held[k] || 0) + v; label[k] = label[k] || String(r['Collected By']).trim(); }
   });
   cash.forEach(r => { if (r.Type === 'HANDOVER' && r.d >= start) { const k = key(r.Note.split('|')[0]); held[k] = (held[k] || 0) - num_(r.Amount); label[k] = label[k] || r.Note.split('|')[0].trim(); } });
   expenseRows_().forEach(r => { if (r.date && r.date >= start) { add(r.paidFrom || accts[0], -r.amount); outflow += r.amount; } });
@@ -1072,7 +1090,7 @@ function alert_(text) {
 function voidEntry_(u, b) {
   const reason = String(b.reason || '').trim(); if (!reason) throw new Error('Reason is required');
   const tab = b.tab === 'Expenses' ? CFG.TABS.EXP : CFG.TABS.RECEIVE;
-  const width = tab === CFG.TABS.EXP ? 9 : 13;
+  const width = tab === CFG.TABS.EXP ? 9 : 14;
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) throw new Error('Another save is running. Try again in a moment.');
   let out;
@@ -1210,8 +1228,10 @@ function monthReport_(ym) {
   const inM = d => d && d >= from && d < to;
   const col = { deposits: 0, serviceCharge: 0, mosjid: 0, byAccount: {}, count: 0 };
   receiveRows_().forEach(r => { if (!inM(r.date)) return; col.count++;
-    if (r.mid === CFG.MOSJID_ID) col.mosjid += r.deposit; else { col.deposits += r.deposit; col.serviceCharge += r.sc; }
-    const a = r.account || 'not recorded'; col.byAccount[a] = (col.byAccount[a] || 0) + r.deposit + r.sc; });
+    const scNow = r.scLater ? 0 : r.sc;
+    if (r.mid === CFG.MOSJID_ID) col.mosjid += r.deposit; else { col.deposits += r.deposit; col.serviceCharge += scNow; }
+    const a = r.account || 'not recorded'; col.byAccount[a] = (col.byAccount[a] || 0) + r.deposit + scNow; });
+  rowsAsObjects_(CFG.TABS.SCC, SCC_COLS).forEach(r => { const d = toDate_(r.Date); if (!inM(d)) return; const v = num_(r.Amount); col.serviceCharge += v; col.lateServiceCharge = (col.lateServiceCharge || 0) + v; const a = r.Account || 'not recorded'; col.byAccount[a] = (col.byAccount[a] || 0) + v; });
   const exp = { Somiti: 0, Mosjid: 0, Withdrawal: 0, rows: [] };
   expenseRows_().forEach(e => { if (!inM(e.date)) return; const f = e.fund; exp[f] = (exp[f] || 0) + e.amount; exp.rows.push({ date: fmtDate_(e.date), purpose: e.purpose, amount: e.amount, fund: f }); });
   const newMembers = rowsAsObjects_(CFG.TABS.ACCTS, ACCT_COLS).filter(a => inM(toDate_(a.LinkedAt) || (a.LinkedAt instanceof Date ? a.LinkedAt : null)) && /^new/.test(a.Reason)).map(a => a.MID + ' ' + a.AccountName);
@@ -1288,4 +1308,65 @@ function monthlySummarySms_() {
   const r = monthReport_(Utilities.formatDate(prev, tz_(), 'yyyy-MM'));
   const c = r.collections, e = r.expenses;
   alert_(r.month + ': collected ' + (c.deposits + c.serviceCharge + c.mosjid).toLocaleString('en-US') + ' Tk, expenses ' + (e.Somiti + e.Mosjid).toLocaleString('en-US') + ' Tk, ' + r.due.length + ' members due. Full report in the app: More > Monthly report.');
+}
+
+
+/* =====================================================================
+ * SERVICE CHARGE PAID LATER
+ * A month saved without its service charge has Service Charge = 0 in Receive.
+ * Due = those months x the service charge rate. When the member pays later, the app fills those rows
+ * (so every Dashboard formula stays correct), marks them in "SC Paid Later" with the receipt, and logs the
+ * money in App_SC_Collections with the real date + account (used by the cash book and monthly report).
+ * ===================================================================== */
+function scDueMap_() {
+  return memo_('scdue', () => {
+    const rate = num_(getSettings_().SERVICE_CHARGE_PER_MONTH);
+    const out = {};
+    if (!rate) return out;
+    receiveRows_().forEach(r => {
+      if (r.mid === CFG.MOSJID_ID || r.deposit <= 0 || r.sc > 0) return;
+      const o = out[r.mid] || (out[r.mid] = { months: [], rows: [], amount: 0 });
+      o.months.push(fmtMonth_(r.forMonth)); o.rows.push(r.row); o.amount += rate;
+    });
+    return out;
+  });
+}
+function scDueList_() {
+  const m = scDueMap_(); const info = readInfo_();
+  return Object.keys(m).map(mid => ({ mid, name: (info[mid] || {}).name || '', months: m[mid].months, amount: m[mid].amount })).sort((a, b) => b.amount - a.amount);
+}
+function collectSc_(u, b) {
+  if (!can_(u, 'payments')) throw new Error('Not allowed');
+  const mid = String(b.mid || '').trim();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error('Another save is running. Try again in a moment.');
+  let r;
+  try { r = scCollectLocked_(u, mid, { account: checkAccount_(b.account), collectedBy: b.collectedBy, date: toDate_(b.date) || new Date() }); }
+  finally { lock.releaseLock(); }
+  if (r.amount) {
+    const info = readInfo_()[mid] || {};
+    const s = smsToHolder_(mid, (getSettings_().SOMITI_NAME || 'At-Taqwa Somiti') + ': ' + mid + ' (' + (info.name || '') + ') service charge ' + r.amount.toLocaleString('en-US') + ' Tk received for ' + r.months.length + ' month(s). Receipt ' + r.receipt + '.');
+    r.sms = s.sms; r.wa = s.wa; r.waOnly = s.waOnly;
+  }
+  return r;
+}
+/** Caller must hold the script lock. opts: { account, collectedBy, date, receipt?, excludeFrom? (row number: skip rows saved in this same payment) } */
+function scCollectLocked_(u, mid, opts) {
+  bust_();
+  const due = scDueMap_()[mid];
+  if (!due) return { amount: 0, months: [], receipt: opts.receipt || '' };
+  const rows = due.rows.filter(rn => !opts.excludeFrom || rn < opts.excludeFrom);
+  if (!rows.length) return { amount: 0, months: [], receipt: opts.receipt || '' };
+  const rate = num_(getSettings_().SERVICE_CHARGE_PER_MONTH);
+  const receipt = opts.receipt || nextReceipt_();
+  const s = sh_(CFG.TABS.RECEIVE);
+  rows.forEach(rn => { s.getRange(rn, 6).setValue(rate); s.getRange(rn, 14).setValue(receipt); });
+  const months = rows.map(rn => due.months[due.rows.indexOf(rn)]);
+  const amount = rows.length * rate;
+  const info = readInfo_()[mid] || {};
+  sh_(CFG.TABS.SCC).appendRow([dateOut_(opts.date || new Date()), mid, info.name || '', months.join(', '), amount, opts.account || moneyAccounts_()[0], String(opts.collectedBy || ''), receipt, new Date(), u.UserID]);
+  SpreadsheetApp.flush();
+  audit_(u, 'collect_old_sc', { mid, months, amount, receipt });
+  markDirty_();
+  return { mid, amount, months, receipt };
 }
