@@ -288,6 +288,7 @@ function doPost(e) {
         ledger: () => ledger_(u, b.mid),
         preview: () => { if (!can_(u, 'payments')) throw new Error('Not allowed'); return preview_(b.mid, b.count); },
         payInit: () => payInit_(u),
+        sendQueued: () => { if (!can_(u, 'payments')) throw new Error('Not allowed'); return sendQueued_(b.key); },
         addPayment: () => addPayment_(u, b),
         addMosjid: () => addMosjid_(u, b),
         transactions: () => { if (!isStaff_(u)) throw new Error('Not allowed'); return transactions_(b.limit || 50); },
@@ -593,6 +594,8 @@ function addPayment_(u, b) {
     }
     audit_(u, 'add_payment', result);
   } finally { lock.releaseLock(); }
+  // deferSms: the app shows "Saved" at once and asks for the SMS in a second call (a timer sends it anyway if the app never asks).
+  const defer = b.deferSms === true; const queue = [];
   if (b.sendSms !== false && String(getSettings_().SMS_ON_PAYMENT).toUpperCase() === 'YES') {
     const m = result.months;
     const period = m.length === 1 ? m[0] : m[0] + ' to ' + m[m.length - 1];
@@ -600,10 +603,20 @@ function addPayment_(u, b) {
     const msg = (getSettings_().SOMITI_NAME || 'At-Taqwa Somiti') + ': ' + result.mid + ' (' + result.name + ') ' +
       (result.total).toLocaleString('en-US') + ' Tk received for ' + period + (result.oldSc ? ' + old service charge' : '') + '. Paid up to ' + m[m.length - 1] + '.' +
       (owedNow ? ' Service charge due: ' + owedNow.toLocaleString('en-US') + ' Tk.' : '') + ' Receipt ' + result.receipt;
-    const s = smsToHolder_(mid, msg);
-    result.sms = s.sms; result.wa = s.wa; result.waOnly = s.waOnly;
+    if (defer) {
+      const h = holderPhone_(mid);
+      result.wa = waLink_(h.phone, msg); result.waOnly = !normPhone_(h.phone) && !!waNumber_(h.phone);
+      if (normPhone_(h.phone)) queue.push({ to: h.to, phone: h.phone, msg });
+    } else {
+      const s = smsToHolder_(mid, msg);
+      result.sms = s.sms; result.wa = s.wa; result.waOnly = s.waOnly;
+    }
   }
-  if (result.total >= (num_(getSettings_().ALERT_OVER) || Infinity)) alert_('Payment ' + result.receipt + ': ' + result.total.toLocaleString('en-US') + ' Tk from ' + result.mid + ' (' + result.name + ').');
+  if (result.total >= (num_(getSettings_().ALERT_OVER) || Infinity)) {
+    const text = 'Payment ' + result.receipt + ': ' + result.total.toLocaleString('en-US') + ' Tk from ' + result.mid + ' (' + result.name + ').';
+    if (defer) { const it = alertItem_(text); if (it) queue.push(it); } else alert_(text);
+  }
+  if (queue.length) { queueSms_(result.receipt, queue); result.smsPending = true; }
   return result;
 }
 
@@ -1097,6 +1110,7 @@ function backupStatus_() {
 /* ---------------- scheduled jobs (names without _ so triggers can call them) ---------------- */
 /** Every 10 minutes: if something changed, push the money tabs to GitHub latest/. */
 function jobQuickBackup() {
+  try { sweepSms_(); } catch (e) { /* never block the backup */ }
   if (!props_().getProperty('BACKUP_DIRTY')) return;
   let r;
   try { r = pushToGithub_(backupTabs_([CFG.TABS.RECEIVE, CFG.TABS.EXP, CFG.TABS.CASH, CFG.TABS.RECON, CFG.TABS.AUDIT, CFG.TABS.INFO, CFG.TABS.ACCTS]), ['latest'], 'after entry'); }
@@ -1132,10 +1146,37 @@ function testDriveBackup() { backupDrive_(); Logger.log(props_().getProperty('BA
  * ===================================================================== */
 
 /* ---------------- admin alerts ---------------- */
-function alert_(text) {
+function alertItem_(text) {
   const phone = String(getSettings_().ALERT_PHONE || '').trim();
-  if (!phone) return;
-  try { sendSms_('ALERT', phone, (getSettings_().SOMITI_NAME || 'At-Taqwa Somiti') + ' alert: ' + text); } catch (e) { /* never block a save */ }
+  return phone ? { to: 'ALERT', phone, msg: (getSettings_().SOMITI_NAME || 'At-Taqwa Somiti') + ' alert: ' + text } : null;
+}
+function alert_(text) {
+  const it = alertItem_(text);
+  if (!it) return;
+  try { sendSms_(it.to, it.phone, it.msg); } catch (e) { /* never block a save */ }
+}
+
+/* ---------------- SMS sent after the save (so "Saved" shows fast) ---------------- */
+/** Kept in script properties (not the cache) so a queued SMS is never lost. */
+function queueSms_(key, items) { props_().setProperty('SMSQ_' + key, JSON.stringify({ at: Date.now(), items })); }
+/** Sends what was queued under this key, exactly once (take-then-send under the lock). */
+function sendQueued_(key) {
+  const p = props_(); const name = 'SMSQ_' + String(key || '');
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error('Busy. The SMS will be sent in a few minutes.');
+  let raw;
+  try { raw = p.getProperty(name); if (raw) p.deleteProperty(name); } finally { lock.releaseLock(); }
+  if (!raw) return { sms: 'already sent' };
+  let first = '';
+  JSON.parse(raw).items.forEach((it, i) => { const r = sendSms_(it.to, it.phone, it.msg); if (i === 0) first = r; });
+  return { sms: first };
+}
+/** Timer: send any SMS the app never asked for (app closed right after saving). */
+function sweepSms_() {
+  const all = props_().getProperties();
+  Object.keys(all).filter(k => k.indexOf('SMSQ_') === 0).forEach(k => {
+    try { if (Date.now() - JSON.parse(all[k]).at > 120000) sendQueued_(k.slice(5)); } catch (e) { props_().deleteProperty(k); }
+  });
 }
 
 /* ---------------- void a wrong entry ---------------- */
@@ -1483,8 +1524,15 @@ function collectSc_(u, b) {
   finally { lock.releaseLock(); }
   if (r.amount) {
     const info = readInfo_()[mid] || {};
-    const s = smsToHolder_(mid, (getSettings_().SOMITI_NAME || 'At-Taqwa Somiti') + ': ' + mid + ' (' + (info.name || '') + ') service charge ' + r.amount.toLocaleString('en-US') + ' Tk received for ' + r.months.length + ' month(s). Receipt ' + r.receipt + '.');
-    r.sms = s.sms; r.wa = s.wa; r.waOnly = s.waOnly;
+    const msg = (getSettings_().SOMITI_NAME || 'At-Taqwa Somiti') + ': ' + mid + ' (' + (info.name || '') + ') service charge ' + r.amount.toLocaleString('en-US') + ' Tk received for ' + r.months.length + ' month(s). Receipt ' + r.receipt + '.';
+    if (b.deferSms === true) {
+      const h = holderPhone_(mid);
+      r.wa = waLink_(h.phone, msg); r.waOnly = !normPhone_(h.phone) && !!waNumber_(h.phone);
+      if (normPhone_(h.phone)) { queueSms_(r.receipt, [{ to: h.to, phone: h.phone, msg }]); r.smsPending = true; }
+    } else {
+      const s = smsToHolder_(mid, msg);
+      r.sms = s.sms; r.wa = s.wa; r.waOnly = s.waOnly;
+    }
   }
   return r;
 }

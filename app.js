@@ -117,6 +117,28 @@
       const first = q('input,select'); if (first && o.focus !== false) setTimeout(() => first.focus(), 50);
     });
   }
+  /* Member picker: search by name or ID, shows each member's status. Resolves the Member ID or null. */
+  function pickMember(list) {
+    return new Promise((done) => {
+      const w = document.createElement('div'); w.className = 'ov';
+      w.innerHTML = '<div class="sheet picker" role="dialog" aria-modal="true" aria-label="Choose member"><h2>Choose member</h2><input id="pk_q" type="search" placeholder="Search name or ID…" autocomplete="off" aria-label="Search name or ID"><div id="pk_l" class="pk-list"></div><button type="button" class="btn sec" id="pk_no">Cancel</button></div>';
+      document.body.appendChild(w);
+      const key = (e) => { if (e.key === 'Escape') close(null); };
+      const close = (v) => { document.removeEventListener('keydown', key); w.remove(); done(v); };
+      document.addEventListener('keydown', key);
+      w.onclick = (e) => { if (e.target === w) close(null); };
+      w.querySelector('#pk_no').onclick = () => close(null);
+      const draw = () => {
+        const q = w.querySelector('#pk_q').value.trim().toLowerCase();
+        const f = list.filter((a) => !q || (a.name + ' ' + a.mid).toLowerCase().indexOf(q) >= 0);
+        w.querySelector('#pk_l').innerHTML = f.map((a) => '<button type="button" class="pk" data-mid="' + esc(a.mid) + '"><span class="pk-t"><span class="t">' + esc(a.name) + '</span><span class="s">' + esc(a.mid) + ' · paid up to ' + esc(a.paidUpTo) + (a.scOwed ? ' · SC due ' + tk(a.scOwed) : '') + '</span></span>' + statusChip(a.status) + '</button>').join('') || '<div class="muted" style="padding:16px 0">No member found</div>';
+        w.querySelectorAll('.pk').forEach((b) => b.onclick = () => close(b.dataset.mid));
+      };
+      w.querySelector('#pk_q').oninput = draw; draw();
+      w.querySelector('#pk_q').onkeydown = (e) => { if (e.key === 'Enter') { const one = w.querySelectorAll('.pk'); if (one.length === 1) close(one[0].dataset.mid); } };
+      setTimeout(() => w.querySelector('#pk_q').focus(), 50);
+    });
+  }
   const ask = (text, okLabel, danger) => sheet({ title: 'Please confirm', text, ok: okLabel || 'Yes, continue', danger }).then((v) => !!v);
   const info = (text, title) => sheet({ title: title || 'Note', text, ok: 'OK', cancel: false });
   const showPin = (id, pin, extra) => sheet({ title: 'First PIN for ' + id, html: '<div class="pin">' + esc(pin) + '</div><div class="shtext">' + esc(extra || '').replace(/\n/g, '<br>') + '<br>They must set their own PIN at first login.</div>', copy: pin, ok: 'Done', cancel: false });
@@ -262,9 +284,19 @@
         return '<div class="kv"><span class="l">' + esc(i.label.replace(/\s*\((type here|calculated|liability|income)[^)]*\)/i, '')) + '</span><span class="v">' + (ok ? '<span class="chip ok">OK</span>' : esc(i.value)) + '</span></div>';
       }).join('') + '</div>';
       const due = d.members.filter((m) => /due/i.test(m.status));
-      view.innerHTML = '<h2>Dashboard</h2>' + d.left.map(sec).join('') + d.right.map(sec).join('') +
-        '<h3>Members with dues (' + due.length + ')</h3><div class="card list">' +
-        (due.length ? due.map((m) => '<div class="item" data-mid="' + esc(m.mid) + '"><div><div class="t">' + esc(m.name) + '</div><div class="s">' + esc(m.mid) + ' · paid up to ' + esc(m.paidUpTo) + '</div></div><div class="row">' + statusChip(m.status) + (can('payments') ? '<a class="btn sm" href="#/pay/' + esc(m.mid) + '" data-stop>Collect</a>' : '') + '</div></div>').join('') : '<div class="muted">Nobody is due 🎉</div>') + '</div>';
+      const all = []; d.left.concat(d.right).forEach((s) => s.items.forEach((i) => all.push(i)));
+      const val = (re) => { const i = all.find((x) => re.test(x.label)); return i ? i.value : null; };
+      const tile = (label, v, sub, href) => v === null || v === '' ? '' : '<' + (href ? 'a href="' + href + '"' : 'div') + ' class="stat tile"><div class="l">' + esc(label) + '</div><div class="v">' + esc(v) + '</div>' + (sub ? '<div class="s">' + esc(sub) + '</div>' : '') + '</' + (href ? 'a' : 'div') + '>';
+      const tk2 = (v) => v === null ? null : v + ' Tk';
+      const totalDue = val(/^total due/i);
+      view.innerHTML = '<h2>Dashboard</h2><div class="grid tiles">' +
+        tile('Total balance', tk2(val(/^total balance/i)), 'both funds') +
+        tile('Received this month', tk2(val(/^received this month/i)), val(/^paid for this month/i) ? val(/^paid for this month/i) + ' of members paid' : '') +
+        tile('Members due', String(due.length), totalDue ? totalDue + ' Tk to collect' : '', '#duelist') +
+        tile('Cash in hand', tk2(val(/^cash in hand/i)), isStaff() ? 'tap for cash book' : '', '#/cash') + '</div>' +
+        '<h3 id="duelist">Members with dues (' + due.length + ')</h3><div class="card list">' +
+        (due.length ? due.map((m) => '<div class="item" data-mid="' + esc(m.mid) + '"><div><div class="t">' + esc(m.name) + '</div><div class="s">' + esc(m.mid) + ' · paid up to ' + esc(m.paidUpTo) + '</div></div><div class="row">' + statusChip(m.status) + (can('payments') ? '<a class="btn sm" href="#/pay/' + esc(m.mid) + '" data-stop>Collect</a>' : '') + '</div></div>').join('') : '<div class="muted">Nobody is due 🎉</div>') + '</div>' + d.left.map(sec).join('') + d.right.map(sec).join('');
+      const dl = view.querySelector('a[href="#duelist"]'); if (dl) dl.onclick = (ev) => { ev.preventDefault(); $('#duelist').scrollIntoView({ behavior: 'smooth' }); };
       view.querySelectorAll('[data-mid]').forEach((el) => el.onclick = (ev) => { if (ev.target.closest('[data-stop]')) return; location.hash = '#/ledger/' + el.dataset.mid; });
     } catch (e) { fail(e); }
   }
@@ -382,7 +414,7 @@
       '<label for="acct">Received into</label><select id="acct">' + moneyOpts(money, lastAcct) + '</select>';
     view.innerHTML = '<h2>New Payment</h2><div class="tabs"><button type="button" class="' + (mode === 'member' ? 'on' : '') + '" id="tmem">Member deposit</button><button type="button" class="' + (mode === 'mosjid' ? 'on' : '') + '" id="tmos">🕌 Mosjid Fund</button></div>' +
       '<div class="card">' + (mode === 'member'
-        ? '<label for="mid">Member</label><select id="mid"><option value="">Choose member…</option>' + opts(pre) + '</select>' +
+        ? '<label for="midbtn">Member</label><button type="button" class="pick" id="midbtn">Choose member…</button><input type="hidden" id="mid" value="' + esc(list.some((a) => a.mid === pre) ? pre : '') + '">' +
           '<div id="minfo"></div>' +
           '<label for="cnt">Number of months</label><div class="stepper"><button type="button" id="minus" aria-label="One month less">−</button><input id="cnt" type="number" min="1" max="60" value="1" inputmode="numeric"><button type="button" id="plus" aria-label="One month more">+</button></div>' +
           '<label class="check"><input type="checkbox" id="scnow" checked> Service charge paid now</label>' +
@@ -443,6 +475,7 @@
     };
     const showMember = () => {
       const a = list.find((x) => x.mid === $('#mid').value);
+      $('#midbtn').textContent = a ? a.mid + ' · ' + a.name : 'Choose member…'; $('#midbtn').classList.toggle('has', !!a);
       if (!a) { $('#minfo').innerHTML = ''; $('#oldwrap').style.display = 'none'; $('#oldsc').checked = false; paint(); return; }
       const due = (String(a.status).match(/^(\d+)\s*Due/i) || [])[1];
       $('#minfo').innerHTML = '<div class="preview" style="margin-top:10px">' + kvRow('Paid up to', a.paidUpTo) + kvRow('Status', statusChip(a.status), true) +
@@ -453,7 +486,8 @@
       if (a.scOwed) { $('#oldwrap').style.display = ''; $('#oldtxt').textContent = 'Also collect old service charge due (' + tk(a.scOwed) + ' Tk)'; } else $('#oldwrap').style.display = 'none';
       paint();
     };
-    $('#mid').onchange = showMember; $('#cnt').oninput = paint; $('#scnow').onchange = paint; $('#oldsc').onchange = paint;
+    $('#midbtn').onclick = async () => { const m = await pickMember(list); if (m) { $('#mid').value = m; dirty = true; showMember(); } };
+    $('#cnt').oninput = paint; $('#scnow').onchange = paint; $('#oldsc').onchange = paint;
     $('#minus').onclick = () => { $('#cnt').value = Math.max(1, (+$('#cnt').value || 1) - 1); paint(); };
     $('#plus').onclick = () => { $('#cnt').value = Math.min(60, (+$('#cnt').value || 1) + 1); paint(); };
     if (pre) showMember();
@@ -470,17 +504,19 @@
       const mid = c.a.mid, cbv = $('#cb').value, dateTxt = $('#dd').value;
       try {
         remember();
-        const r = await api('addPayment', { mid, count: c.n, expectFirst: c.months[0], depositDate: dateTxt, collectedBy: cbv, remarks: $('#rm').value, account: $('#acct').value, scPaid: c.scNow, collectOldSc: !!c.old });
+        const r = await api('addPayment', { mid, count: c.n, expectFirst: c.months[0], depositDate: dateTxt, collectedBy: cbv, remarks: $('#rm').value, account: $('#acct').value, scPaid: c.scNow, collectOldSc: !!c.old, deferSms: true });
         state.accounts = null;
         view.innerHTML = '<div class="card"><h2>✅ Saved</h2>' + kvRow('Receipt', r.receipt) + kvRow('Member', r.mid + ' · ' + r.name) + kvRow('Months', r.months.join(', ')) + kvRow('Total', tk(r.total) + ' Tk') +
           (r.oldSc ? kvRow('Incl. old service charge', tk(r.oldSc) + ' Tk') : '') +
           (r.scSkipped ? kvRow('Service charge', '<span style="color:var(--red)">not paid now: shows as due</span>', true) : '') +
-          (r.sms && !r.waOnly ? kvRow('SMS', r.sms) : '') +
+          (r.smsPending ? '<div class="kv"><span class="l">SMS</span><span class="v muted" id="smsst">sending…</span></div>' : (r.sms && !r.waOnly ? kvRow('SMS', r.sms) : '')) +
           (r.wa ? '<a class="btn ' + (r.waOnly ? '' : 'sec') + '" style="background:' + (r.waOnly ? '#25D366' : '') + '" href="' + esc(r.wa) + '" target="_blank" rel="noopener">💬 Send on WhatsApp' + (r.waOnly ? ' (no SMS for this number)' : '') + '</a>' : '') +
           '<button class="btn sec" id="shr">🧾 Share receipt image</button><button class="btn" id="newp">New payment</button><a class="btn sec" href="#/ledger/' + esc(r.mid) + '">View ledger</a></div>';
         $('#shr').onclick = () => shareReceipt({ receipt: r.receipt, member: r.mid + ' · ' + r.name, forText: r.months.length > 1 ? r.months[0] + ' to ' + r.months[r.months.length - 1] + ' (' + r.months.length + ' months)' : r.months[0], date: dateTxt, collectedBy: cbv, amount: r.total });
         $('#newp').onclick = () => again('member');
         window.scrollTo(0, 0);
+        if (r.smsPending) apiLive('sendQueued', { key: r.receipt }).then((q) => { const el = $('#smsst'); if (el) el.textContent = /^200/.test(q.sms) ? 'sent ✓' : q.sms; })
+          .catch(() => { const el = $('#smsst'); if (el) el.textContent = 'will be sent in a few minutes'; });
       } catch (e) {
         if (/Months changed/.test(e.message)) { clearCache(); toast(e.message, 7000); viewPay([mid]); return; }
         $('#perr').textContent = e.message; toast(e.message, 6000); b.disabled = false; b.textContent = 'Save';
@@ -727,7 +763,8 @@
         if (!await ask('Collect ' + tk(x.amount) + ' Tk service charge from ' + x.mid + ' (' + x.name + ') for ' + x.months.length + ' month(s)?')) return;
         b.disabled = true; b.textContent = 'Saving…';
         try {
-          const r = await api('collectSc', { mid: x.mid, account: $('#sacct').value, collectedBy: $('#scb').value, date: $('#sdate').value });
+          const r = await api('collectSc', { mid: x.mid, account: $('#sacct').value, collectedBy: $('#scb').value, date: $('#sdate').value, deferSms: true });
+          if (r.smsPending) apiLive('sendQueued', { key: r.receipt }).catch(() => {});
           toast('Saved ' + r.receipt + ' · ' + tk(r.amount) + ' Tk');
           if (r.waOnly && r.wa) window.open(r.wa, '_blank');
           state.accounts = null; viewScDue(args);
@@ -879,6 +916,14 @@
   }
 
   /* ---------- start ---------- */
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+    // The app opens from the saved copy at once; when a newer version has been downloaded, offer it.
+    navigator.serviceWorker.addEventListener('message', (e) => {
+      if (e.data !== 'update' || document.getElementById('upd')) return;
+      const b = document.createElement('button'); b.id = 'upd'; b.className = 'upd'; b.type = 'button'; b.textContent = 'New version ready · tap to update';
+      b.onclick = () => location.reload(); document.body.appendChild(b);
+    });
+  }
   go();
 })();
