@@ -54,10 +54,16 @@ const DOC_COLS = ['MID', 'Type', 'File ID', 'File Name', 'Uploaded At', 'Uploade
 
 /* ---------------- helpers ---------------- */
 function props_() { return PropertiesService.getScriptProperties(); }
+/* Speed: within one request, each tab is read at most once (cleared after any write). */
+let SS_ = null; let MEMO_ = {};
+function memo_(k, fn) { if (!(k in MEMO_)) MEMO_[k] = fn(); return MEMO_[k]; }
+function bust_() { MEMO_ = {}; }
 function ss_() {
+  if (SS_) return SS_;
   const id = props_().getProperty('SHEET_ID');
   if (!id) throw new Error('SHEET_ID script property is missing');
-  return SpreadsheetApp.openById(id);
+  SS_ = SpreadsheetApp.openById(id);
+  return SS_;
 }
 function sh_(name) {
   const s = ss_().getSheetByName(name);
@@ -72,7 +78,7 @@ const MONTHS_ = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','no
 
 /** Accepts Date, "1-May-2025", "May-2025", "2025-05-01". Returns Date or null. */
 function toDate_(v) {
-  if (v instanceof Date && !isNaN(v)) return v;
+  if (v instanceof Date && !isNaN(v)) return dateIn_(v);
   const s = String(v || '').trim();
   if (!s) return null;
   let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
@@ -83,15 +89,34 @@ function toDate_(v) {
   if (m) { const mi = MONTHS_.indexOf(m[1].toLowerCase()); if (mi >= 0) return new Date(+m[2], mi, 1); }
   return null;
 }
+/*
+ * Time zones: the spreadsheet may use a different time zone from this script (Asia/Dhaka).
+ * Dates are written as midnight IN THE SPREADSHEET'S time zone and read back by the spreadsheet's calendar day,
+ * so a day or month never slips (e.g. 1-Apr written from Dhaka showing as 31-Mar in the sheet).
+ */
+let SS_TZ_ = null;
+function ssTz_() { if (!SS_TZ_) SS_TZ_ = ss_().getSpreadsheetTimeZone() || tz_(); return SS_TZ_; }
+/** Sheet date value -> local calendar date (y, m, d as shown in the sheet). */
+function dateIn_(v) {
+  const p = Utilities.formatDate(v, ssTz_(), 'yyyy-MM-dd').split('-');
+  return new Date(+p[0], +p[1] - 1, +p[2]);
+}
+/** Local calendar date -> value to write so the sheet shows exactly that day. */
+function dateOut_(d) {
+  if (!(d instanceof Date) || isNaN(d)) return d;
+  return Utilities.parseDate(Utilities.formatDate(d, tz_(), 'yyyy-MM-dd') + ' 00:00', ssTz_(), 'yyyy-MM-dd HH:mm');
+}
 function monthStart_(d) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 function addMonths_(d, n) { return new Date(d.getFullYear(), d.getMonth() + n, 1); }
 function monthKey_(d) { return d.getFullYear() * 12 + d.getMonth(); }
 
 function readTable_(name) {
-  const s = sh_(name);
-  const v = s.getDataRange().getValues();
-  const head = v.shift() || [];
-  return { sheet: s, head: head, rows: v };
+  return memo_('t:' + name, () => {
+    const s = sh_(name);
+    const v = s.getDataRange().getValues();
+    const head = v.shift() || [];
+    return { sheet: s, head: head, rows: v };
+  });
 }
 function rowsAsObjects_(name, cols) {
   const t = readTable_(name);
@@ -102,14 +127,17 @@ function rowsAsObjects_(name, cols) {
   }).filter(o => String(o[cols[0]] || '').trim() !== '');
 }
 function setCells_(name, rowNum, cols, obj) {
+  bust_();
   const s = sh_(name);
   const vals = cols.map(c => obj[c] === undefined ? '' : obj[c]);
   s.getRange(rowNum, 1, 1, cols.length).setValues([vals]);
 }
 function getSettings_() {
-  const out = {};
-  readTable_(CFG.TABS.SETTINGS).rows.forEach(r => { if (r[0]) out[String(r[0]).trim()] = r[1]; });
-  return out;
+  return memo_('settings', () => {
+    const out = {};
+    readTable_(CFG.TABS.SETTINGS).rows.forEach(r => { if (r[0]) out[String(r[0]).trim()] = r[1]; });
+    return out;
+  });
 }
 function audit_(user, action, details) {
   sh_(CFG.TABS.AUDIT).appendRow([new Date(), user ? user.UserID : 'system', action, typeof details === 'string' ? details : JSON.stringify(details)]);
@@ -124,7 +152,9 @@ function ensureHeaders_(sheet, startCol, names) {
   const cur = sheet.getRange(1, startCol, 1, names.length).getValues()[0];
   names.forEach((n, i) => { if (String(cur[i]).trim() === '') sheet.getRange(1, startCol + i).setValue(n).setFontWeight('bold'); });
 }
-function markDirty_() { props_().setProperty('BACKUP_DIRTY', String(Date.now())); }
+/** Sets a number format, but quietly skips columns that are typed (Sheets tables format those themselves). */
+function fmt_(range, f) { try { range.setNumberFormat(f); } catch (e) { /* typed table column: format is already set */ } }
+function markDirty_() { bust_(); props_().setProperty('BACKUP_DIRTY', String(Date.now())); }
 
 /* ---------------- one-time setup ---------------- */
 /** Run once from the editor. Safe to run again: it only adds what is missing. */
@@ -191,7 +221,7 @@ function addStaff_(userId, name, phone, role, perms, pin) {
   const users = rowsAsObjects_(CFG.TABS.USERS, USER_COLS);
   if (users.some(u => u.UserID === userId)) throw new Error('User exists: ' + userId);
   const salt = Utilities.getUuid();
-  sh_(CFG.TABS.USERS).appendRow([userId, name, phone, role, perms || '', hash_(pin, salt), salt, 'active', 0, '', '']);
+  sh_(CFG.TABS.USERS).appendRow([userId, name, phone, role, perms || '', hash_(pin, salt), salt, 'active', 0, '', '']); bust_();
   audit_(null, 'add_staff', { userId, role });
 }
 
@@ -331,14 +361,16 @@ function changePin_(u, b) {
 
 /* ---------------- read data ---------------- */
 /** INFORMATION has a few title rows; the header is the row whose column A is "MID". */
-function infoSheet_() {
+function infoSheet_() { return memo_('infoSheet', infoSheetRead_); }
+function infoSheetRead_() {
   const s = sh_(CFG.TABS.INFO);
   const v = s.getDataRange().getDisplayValues();
   let hr = v.findIndex(r => String(r[0]).trim().toUpperCase() === 'MID');
   if (hr < 0) hr = 0;
   return { sheet: s, head: v[hr].map(h => String(h).trim()), headerRow: hr + 1, rows: v.slice(hr + 1), firstDataRow: hr + 2 };
 }
-function readInfo_() {
+function readInfo_() { return memo_('info', readInfoRead_); }
+function readInfoRead_() {
   const t = infoSheet_();
   const mobCol = t.head.findIndex(h => /mobile/i.test(h));
   const out = {};
@@ -353,7 +385,8 @@ function readInfo_() {
 }
 
 /** Reads the Dashboard tab as-is (its formulas do the maths). */
-function readDashboard_() {
+function readDashboard_() { return memo_('dash', readDashboardRead_); }
+function readDashboardRead_() {
   const v = sh_(CFG.TABS.DASH).getDataRange().getDisplayValues();
   const left = [], right = [];
   let tableAt = -1;
@@ -392,7 +425,8 @@ function accounts_(u) {
 
 function dueMonths_(status) { const m = String(status || '').match(/^(\d+)\s*Due/i); return m ? Number(m[1]) : 0; }
 
-function receiveRows_() {
+function receiveRows_() { return memo_('recv', receiveRowsRead_).slice(); }
+function receiveRowsRead_() {
   const s = sh_(CFG.TABS.RECEIVE);
   const last = lastFilledRow_(s, 3);
   if (last < 2) return [];
@@ -467,11 +501,11 @@ function nextReceipt_() {
 function writeReceive_(rows) {
   const s = sh_(CFG.TABS.RECEIVE);
   const start = lastFilledRow_(s, 3) + 1;
-  rows = rows.map(r => { const x = r.slice(); while (x.length < 13) x.push(''); return x; });
+  rows = rows.map(r => { const x = r.slice(); while (x.length < 13) x.push(''); x[0] = dateOut_(x[0]); x[1] = dateOut_(x[1]); return x; });
   s.getRange(start, 1, rows.length, 13).setValues(rows);
-  s.getRange(start, 1, rows.length, 1).setNumberFormat('d-mmm-yyyy');
-  s.getRange(start, 2, rows.length, 1).setNumberFormat('mmm-yyyy');
-  s.getRange(start, 10, rows.length, 1).setNumberFormat('d-mmm-yyyy h:mm am/pm');
+  fmt_(s.getRange(start, 1, rows.length, 1), 'd-mmm-yyyy');
+  fmt_(s.getRange(start, 2, rows.length, 1), 'mmm-yyyy');
+  fmt_(s.getRange(start, 10, rows.length, 1), 'd-mmm-yyyy h:mm am/pm');
   SpreadsheetApp.flush();
   // Verify every row landed (fixes the "vanished entry" problem: we never report success unless it's really there).
   const back = s.getRange(start, 3, rows.length, 1).getValues();
@@ -734,6 +768,7 @@ function addMember_(admin, b) {
       const hu = rowsAsObjects_(CFG.TABS.USERS, USER_COLS).find(x => x.UserID === holder);
       if (!hu || hu.Status !== 'active') { t.sheet.getRange(row, 1, 1, t.head.length).clearContent(); throw new Error('Account Holder ' + holder + ' is not an active login'); }
     }
+    bust_();
     sh_(CFG.TABS.ACCTS).appendRow([mid, f.name, holder || mid, now, admin.UserID, holder ? 'new share account under ' + holder : 'new member']);
     sh_(CFG.TABS.USERS).appendRow([mid, f.name, f.phone || '', 'member', '', '', '', holder ? 'linked' : 'active', 0, '', '']);
     audit_(admin, 'add_member', { mid, name: f.name, holder: holder || mid });
@@ -757,7 +792,8 @@ function updateMember_(admin, mid, fields) {
 }
 
 /* ---------------- expenses ---------------- */
-function expenseRows_() {
+function expenseRows_() { return memo_('exp', expenseRowsRead_).slice(); }
+function expenseRowsRead_() {
   const s = sh_(CFG.TABS.EXP);
   const last = lastFilledRow_(s, 3);
   if (last < 2) return [];
@@ -800,8 +836,8 @@ function writeExpense_(u, data, approvedBy) {
     const row = lastFilledRow_(s, 3) + 1;
     voucher = nextReceipt_().replace(/^[A-Z]+/, 'EXP');
     const remarks = data.remarks + (approvedBy ? (data.remarks ? ' · ' : '') + 'approved by ' + approvedBy : '');
-    s.getRange(row, 1, 1, 9).setValues([[toDate_(data.date) || new Date(), data.purpose, data.amount, remarks, data.fund, data.paidFrom, voucher, new Date(), u.UserID]]);
-    s.getRange(row, 1).setNumberFormat('d-mmm-yyyy');
+    s.getRange(row, 1, 1, 9).setValues([[dateOut_(toDate_(data.date) || new Date()), data.purpose, data.amount, remarks, data.fund, data.paidFrom, voucher, new Date(), u.UserID]]);
+    fmt_(s.getRange(row, 1), 'd-mmm-yyyy');
     SpreadsheetApp.flush();
     if (num_(s.getRange(row, 3).getValue()) !== data.amount) throw new Error('Save check failed. Check the Expenses tab.');
     audit_(u, 'add_expense', { voucher, amount: data.amount, fund: data.fund, acct: data.paidFrom, purpose: data.purpose, approvedBy });
@@ -869,7 +905,7 @@ function addCash_(u, b) {
     const to = checkAccount_(b.to); const amt = num_(b.amount); if (amt <= 0) throw new Error('Enter an amount');
     const ref = 'CB-' + Utilities.formatDate(new Date(), tz_(), 'yyMMddHHmmss');
     // Note keeps "person|note" so collector balances can be worked out
-    sh_(CFG.TABS.CASH).appendRow([toDate_(b.date) || new Date(), 'HANDOVER', moneyAccounts_()[0], to, amt, person + '|' + String(b.note || ''), ref, new Date(), u.UserID]);
+    sh_(CFG.TABS.CASH).appendRow([dateOut_(toDate_(b.date) || new Date()), 'HANDOVER', moneyAccounts_()[0], to, amt, person + '|' + String(b.note || ''), ref, new Date(), u.UserID]);
     audit_(u, 'cashbook_handover', { person, to, amt, ref }); markDirty_();
     return { ref };
   }
@@ -878,7 +914,7 @@ function addCash_(u, b) {
   const from = type === 'TRANSFER' || type === 'BANK_CHARGE' ? checkAccount_(b.from) : '';
   const to = type === 'TRANSFER' || type === 'BANK_PROFIT' || type === 'OPENING' ? checkAccount_(b.to) : '';
   if (type === 'TRANSFER' && from === to) throw new Error('From and To must be different');
-  const date = toDate_(b.date) || new Date();
+  const date = dateOut_(toDate_(b.date) || new Date());
   const ref = 'CB-' + Utilities.formatDate(new Date(), tz_(), 'yyMMddHHmmss');
   sh_(CFG.TABS.CASH).appendRow([date, type, from, to, amount, String(b.note || ''), ref, new Date(), u.UserID]);
   audit_(u, 'cashbook_' + type.toLowerCase(), { from, to, amount, ref });
@@ -893,7 +929,7 @@ function reconcile_(u, b) {
   if (!cb.started) throw new Error('Set opening balances first');
   const appBal = cb.balances[acct] || 0;
   const diff = stmt - appBal;
-  sh_(CFG.TABS.RECON).appendRow([toDate_(b.date) || new Date(), acct, stmt, appBal, diff, String(b.note || ''), new Date(), u.UserID]);
+  sh_(CFG.TABS.RECON).appendRow([dateOut_(toDate_(b.date) || new Date()), acct, stmt, appBal, diff, String(b.note || ''), new Date(), u.UserID]);
   audit_(u, 'reconcile', { acct, stmt, appBal, diff });
   markDirty_();
   return { account: acct, statement: stmt, app: appBal, difference: diff };
@@ -1062,6 +1098,7 @@ function voidEntry_(u, b) {
     const now = new Date(); let total = 0;
     const copies = rows.map(rn => { const r = v[rn - 2]; const amt = tab === CFG.TABS.EXP ? num_(r[2]) : num_(r[4]) + num_(r[5]); total += amt;
       return [now, u.UserID, reason, tab, String(r[keyCol] || ''), tab === CFG.TABS.EXP ? '' : String(r[2]), amt, JSON.stringify(r)]; });
+    bust_();
     const vs = sh_(CFG.TABS.VOID);
     vs.getRange(vs.getLastRow() + 1, 1, copies.length, VOID_COLS.length).setValues(copies);
     rows.sort((a, b2) => b2 - a).forEach(rn => s.deleteRow(rn)); // bottom-up so row numbers stay valid
@@ -1102,8 +1139,8 @@ function closeAccount_(u, b) {
     if (pv.deposits > 0) {
       const s = sh_(CFG.TABS.EXP); const row = lastFilledRow_(s, 3) + 1;
       voucher = nextReceipt_().replace(/^[A-Z]+/, 'WDL');
-      s.getRange(row, 1, 1, 9).setValues([[toDate_(b.date) || new Date(), 'Member withdrawal ' + mid + ' (' + pv.name + ')', pv.deposits, 'Paid to: ' + paidTo + '. ' + reason, 'Withdrawal', acct, voucher, new Date(), u.UserID]]);
-      s.getRange(row, 1).setNumberFormat('d-mmm-yyyy');
+      s.getRange(row, 1, 1, 9).setValues([[dateOut_(toDate_(b.date) || new Date()), 'Member withdrawal ' + mid + ' (' + pv.name + ')', pv.deposits, 'Paid to: ' + paidTo + '. ' + reason, 'Withdrawal', acct, voucher, new Date(), u.UserID]]);
+      fmt_(s.getRange(row, 1), 'd-mmm-yyyy');
     }
     t.sheet.getRange(readInfo_()[mid].row, c + 1).setValue('Closed');
     const usr = rowsAsObjects_(CFG.TABS.USERS, USER_COLS).find(x => x.UserID === mid);
