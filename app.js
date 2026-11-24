@@ -147,7 +147,17 @@
   const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   const monthLabel = (k) => MON[k % 12] + '-' + Math.floor(k / 12);
 
-  function busy(text) { dirty = false; view.innerHTML = '<div class="loading">' + esc(text || 'Loading…') + '</div>'; }
+  function busy(text) {
+    dirty = false;
+    view.innerHTML = '<div class="skel" role="status" aria-label="' + esc(text || 'Loading…') + '"><div class="sk h"></div><div class="sk c"></div><div class="sk c s"></div><div class="sk c"></div></div>';
+  }
+  function netBar() {
+    let b = document.getElementById('offl');
+    if (navigator.onLine === false) {
+      if (!b) { b = document.createElement('div'); b.id = 'offl'; b.className = 'offl'; b.setAttribute('role', 'status'); b.textContent = 'No internet · showing saved data. Saving is not possible now.'; document.body.appendChild(b); }
+    } else if (b) { b.remove(); if (state.token) go(true); }
+  }
+  window.addEventListener('online', netBar); window.addEventListener('offline', netBar);
   function fail(e) { view.innerHTML = '<div class="card"><b>Could not load</b><div class="err">' + esc(e.message) + '</div><button class="btn sec" id="retry">Try again</button></div>'; $('#retry').onclick = () => go(); }
 
   const isStaff = () => state.user && (state.user.role === 'admin' || state.user.role === 'management');
@@ -187,21 +197,31 @@
   }
 
   /* ---------- nav ---------- */
+  const svg = (d) => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + d + '</svg>';
+  const IC = {
+    dash: svg('<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>'),
+    users: svg('<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>'),
+    plus: svg('<circle cx="12" cy="12" r="10"/><path d="M8 12h8"/><path d="M12 8v8"/>'),
+    list: svg('<path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/>'),
+    more: svg('<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>'),
+    card: svg('<rect width="20" height="14" x="2" y="5" rx="2"/><path d="M2 10h20"/>'),
+    user: svg('<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>')
+  };
   function navItems() {
     if (!state.user) return [];
-    if (!isStaff()) return [['#/accounts', '💳', 'My Accounts'], ['#/more', '⚙️', 'Settings']];
-    const n = [['#/dashboard', '📊', 'Dashboard'], ['#/accounts', '👥', 'Accounts']];
-    if (can('payments')) n.push(['#/pay', '➕', 'Payment']);
-    n.push(['#/tx', '🧾', 'Activity'], ['#/more', '⚙️', 'More']);
+    if (!isStaff()) return [['#/accounts', IC.card, 'My Accounts'], ['#/more', IC.user, 'Settings']];
+    const n = [['#/dashboard', IC.dash, 'Dashboard'], ['#/accounts', IC.users, 'Accounts']];
+    if (can('payments')) n.push(['#/pay', IC.plus, 'Payment']);
+    n.push(['#/tx', IC.list, 'Activity'], ['#/more', IC.more, 'More']);
     return n;
   }
   function renderChrome() {
     const nav = $('#nav');
     if (!state.user) { nav.classList.add('hidden'); $('#who').textContent = ''; return; }
     if (state.user.mustChangePin) { nav.classList.add('hidden'); $('#who').textContent = state.user.id; return; }
-    $('#who').innerHTML = esc(state.user.name) + '<br>' + esc(state.user.id) + ' · ' + esc(state.user.role);
+    $('#who').textContent = '';
     const cur = location.hash.split('/').slice(0, 2).join('/');
-    nav.innerHTML = navItems().map(([h, i, l]) => '<a href="' + h + '" class="' + (cur === h ? 'on' : '') + '"><span class="i">' + i + '</span>' + l + '</a>').join('');
+    nav.innerHTML = navItems().map(([h, i, l]) => '<a href="' + h + '" class="' + (cur === h ? 'on' : '') + '"' + (cur === h ? ' aria-current="page"' : '') + '><span class="i">' + i + '</span>' + l + '</a>').join('');
     nav.classList.remove('hidden');
   }
 
@@ -225,6 +245,27 @@
     if (keepScroll === true) setTimeout(() => window.scrollTo(0, y), 50); else window.scrollTo(0, 0);
   }
   window.addEventListener('hashchange', () => go());
+  netBar();
+
+  /* ---------- accessibility + error placement, applied to every screen as it is drawn ---------- */
+  let uid = 0;
+  function polish(root) {
+    // every label points at its field, so tapping the label focuses it and screen readers read it
+    root.querySelectorAll('label:not([for])').forEach((l) => {
+      if (l.querySelector('input,select,textarea')) return;
+      let f = l.nextElementSibling; if (f && !/^(INPUT|SELECT|TEXTAREA)$/.test(f.tagName)) f = f.querySelector && f.querySelector('input,select,textarea');
+      if (!f) return; if (!f.id) f.id = 'f' + (++uid); l.htmlFor = f.id;
+    });
+    // tappable rows work with keyboard and are announced as links
+    root.querySelectorAll('div[data-mid]').forEach((el) => { if (!el.hasAttribute('tabindex')) { el.tabIndex = 0; el.setAttribute('role', 'link'); } });
+    root.querySelectorAll('.err').forEach((el) => { if (!el.hasAttribute('role')) el.setAttribute('role', 'alert'); });
+  }
+  new MutationObserver((muts) => {
+    polish(document.body);
+    // an error message that just got text is brought into view (it may be below the screen on a long form)
+    muts.forEach((m) => { const t = m.target.nodeType === 3 ? m.target.parentElement : m.target; if (t && t.classList && t.classList.contains('err') && t.textContent.trim()) t.scrollIntoView({ block: 'center', behavior: 'smooth' }); });
+  }).observe(document.body, { childList: true, subtree: true, characterData: true });
+  document.addEventListener('keydown', (e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target.matches && e.target.matches('div[data-mid]')) { e.preventDefault(); e.target.click(); } });
 
   function logout(silent) {
     if (state.token && !silent) api('logout').catch(() => {});
@@ -349,16 +390,16 @@
           '<div class="kv"><span class="l">Status</span><span class="v">' + statusChip(s.status) + '</span></div>' +
           (L.scOwed ? '<div class="kv"><span class="l">Service charge due</span><span class="v" style="color:var(--red)">' + tk(L.scOwed) + ' Tk</span></div>' : '')
           : '<div class="kv"><span class="l">Total received</span><span class="v">' + tk(total) + ' Tk</span></div>') +
-        '</div>' + (can('payments') && s.mid && L.mid !== 'ATFS-0000' ? '<a class="btn" href="#/pay/' + esc(L.mid) + '">➕ Collect payment</a>' : '') +
-        '<button class="btn sec" id="pdf">⬇ Download statement (PDF)</button>' +
-        (L.mid !== 'ATFS-0000' ? '<a class="btn sec" href="#/profile/' + esc(L.mid) + '">👤 Member profile</a>' : '') +
-        (L.scOwed && can('payments') ? '<a class="btn sec" href="#/scdue/' + esc(L.mid) + '">Collect service charge due (' + tk(L.scOwed) + ' Tk)</a>' : '') +
+        '</div>' + (can('payments') && s.mid && L.mid !== 'ATFS-0000' ? '<a class="btn" href="#/pay/' + esc(L.mid) + '">Collect payment</a>' : '') +
+        '<div class="acts"><button class="btn sm sec" id="pdf">Statement PDF</button>' +
+        (L.mid !== 'ATFS-0000' ? '<a class="btn sm sec" href="#/profile/' + esc(L.mid) + '">Profile</a>' : '') +
+        (L.scOwed && can('payments') ? '<a class="btn sm sec" href="#/scdue/' + esc(L.mid) + '">Collect SC ' + tk(L.scOwed) + ' Tk</a>' : '') + '</div>' +
         (L.donations && L.donations.length ? '<h3>Mosjid Fund donations (' + tk(L.donations.reduce((t, d) => t + d.amount, 0)) + ' Tk)</h3><div class="card">' + L.donations.map((d) => '<div class="ent"><div><b>' + esc(d.date) + '</b><div class="muted">' + esc(d.receipt) + '</div></div><div class="amt">' + tk(d.amount) + '</div></div>').join('') + '</div>' : '') +
         '<h3>History (' + L.entries.length + ')</h3><div class="card">' +
         (L.entries.map((e, i) => '<div class="ent"><div><b>' + esc(e.forMonth) + '</b><div class="muted">Paid ' + esc(e.date) + (e.receipt ? ' · ' + esc(e.receipt) : '') + (e.remarks ? ' · ' + esc(e.remarks) : '') + '</div>' +
-          '<div class="row" style="margin-top:4px;gap:6px">' + (e.receipt ? '<button class="btn sm sec" data-share="' + i + '">🧾 Receipt</button>' : '') + (state.user.role === 'admin' ? '<button class="btn sm sec" data-void="' + i + '" aria-label="More actions for ' + esc(e.forMonth) + '">⋯</button>' : '') + '</div></div>' +
+          '<div class="row" style="margin-top:4px;gap:6px">' + (e.receipt ? '<button class="btn sm sec" data-share="' + i + '">Receipt</button>' : '') + (state.user.role === 'admin' ? '<button class="btn sm sec" data-void="' + i + '" aria-label="More actions for ' + esc(e.forMonth) + '">⋯</button>' : '') + '</div></div>' +
           '<div class="amt">' + tk(e.deposit) + (e.sc ? '<div class="muted">+' + tk(e.sc) + ' SC</div>' : '') + '</div></div>').join('') || '<div class="muted">No entries yet</div>') + '</div>' +
-        (state.user.role === 'admin' && L.mid !== 'ATFS-0000' && s.mid ? '<a class="btn sec" style="color:var(--red)" href="#/close/' + esc(L.mid) + '">Close account / withdrawal</a>' : '');
+        (state.user.role === 'admin' && L.mid !== 'ATFS-0000' && s.mid ? '<p style="text-align:center;margin-top:24px"><a class="quiet" href="#/close/' + esc(L.mid) + '">Close this account / withdrawal…</a></p>' : '');
       $('#pdf').onclick = () => statementPdf(L);
       view.querySelectorAll('[data-share]').forEach((b) => b.onclick = () => {
         const e = L.entries[+b.dataset.share]; const same = L.entries.filter((x) => x.receipt === e.receipt);
@@ -385,8 +426,9 @@
         await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js');
       }
       const clean = (s) => String(s || '').replace(/[^\x20-\x7E]/g, '').trim(); // PDF font is Latin only
-      const doc = new window.jspdf.jsPDF({ unit: 'pt', format: 'a4' });
       const s = L.summary || {};
+      if (/[^\x00-\x7F]/.test(L.name + L.entries.map((e) => e.remarks).join(''))) { statementAsPicture(L, s); return; }
+      const doc = new window.jspdf.jsPDF({ unit: 'pt', format: 'a4' });
       doc.setFontSize(16); doc.text('At-Taqwa Somiti', 40, 50);
       doc.setFontSize(11); doc.text('Member Statement', 40, 68);
       doc.setFontSize(10);
@@ -397,6 +439,30 @@
         styles: { fontSize: 8 }, headStyles: { fillColor: [15, 91, 70] } });
       doc.save(L.mid + '-statement.pdf');
     } catch (e) { toast(e.message); }
+  }
+
+  /* The PDF library has no Bangla font and cannot shape Bangla letters. The phone can, so each page is drawn on a canvas and placed in the PDF. */
+  function statementAsPicture(L, s) {
+    const W = 1240, H = 1754, F = 'system-ui, "Noto Sans Bengali", sans-serif';
+    const doc = new window.jspdf.jsPDF({ unit: 'pt', format: 'a4' });
+    const cols = [[60, 'Deposit Date'], [250, 'For Month'], [430, 'Deposit'], [570, 'Service Charge'], [760, 'Receipt'], [960, 'Remarks']];
+    let c, g, y, page = 0;
+    const flush = () => { if (page) doc.addPage(); doc.addImage(c.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, 595.28, 841.89); page++; };
+    const head = () => { g.fillStyle = '#0f5b46'; g.fillRect(50, y, W - 100, 44); g.fillStyle = '#fff'; g.font = 'bold 22px ' + F; cols.forEach(([x, t]) => g.fillText(t, x, y + 30)); y += 44; };
+    const start = () => { c = document.createElement('canvas'); c.width = W; c.height = H; g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, W, H); y = 70; };
+    start();
+    g.fillStyle = '#1d2421'; g.font = 'bold 40px ' + F; g.fillText('At-Taqwa Somiti', 60, y + 20); g.font = '26px ' + F; g.fillText('Member Statement', 60, y + 60); y += 110;
+    [['Member ID', L.mid], ['Name', L.name], ['Months paid', s.monthsPaid], ['Total deposit (Tk)', s.totalDeposit], ['Service charge (Tk)', s.serviceCharge], ['Paid up to', s.paidUpTo], ['Status', s.status], ['Printed', new Date().toDateString()]]
+      .forEach(([k, v]) => { if (v) { g.font = '22px ' + F; g.fillStyle = '#68736e'; g.fillText(k + ':', 60, y); g.fillStyle = '#1d2421'; g.fillText(String(v), 330, y); y += 34; } });
+    y += 16; head();
+    L.entries.forEach((e, i) => {
+      if (y > H - 90) { flush(); start(); head(); }
+      if (i % 2) { g.fillStyle = '#f3f6f4'; g.fillRect(50, y, W - 100, 38); }
+      g.fillStyle = '#1d2421'; g.font = '20px ' + F;
+      [e.date, e.forMonth, tk(e.deposit), tk(e.sc), e.receipt || '', String(e.remarks || '').slice(0, 26)].forEach((t, j) => g.fillText(String(t), cols[j][0], y + 26));
+      y += 38;
+    });
+    flush(); doc.save(L.mid + '-statement.pdf');
   }
 
   async function viewPay(args) {
@@ -451,7 +517,7 @@
           remember();
           const r = await api('addMosjid', { donors, depositDate: $('#dd').value, collectedBy: $('#cb').value, account: $('#acct').value });
           const dateTxt = $('#dd').value;
-          view.innerHTML = '<div class="card"><h2>✅ Saved</h2>' + kvRow('Receipt', r.receipt) + kvRow('Total', tk(r.amount) + ' Tk') + kvRow('Donors', r.donors) + '<button class="btn sec" id="shr">🧾 Share receipt image</button><button class="btn" id="newp">New entry</button></div>';
+          view.innerHTML = '<div class="card"><h2>✅ Saved</h2>' + kvRow('Receipt', r.receipt) + kvRow('Total', tk(r.amount) + ' Tk') + kvRow('Donors', r.donors) + '<button class="btn sec" id="shr">Share receipt image</button><button class="btn" id="newp">New entry</button></div>';
           $('#shr').onclick = () => shareReceipt({ receipt: r.receipt, member: 'Mosjid Fund donation', forText: r.donors, date: dateTxt, amount: r.amount });
           $('#newp').onclick = () => again('mosjid');
         } catch (e) { $('#perr').textContent = e.message; toast(e.message, 6000); b.disabled = false; b.textContent = 'Save'; }
@@ -510,8 +576,8 @@
           (r.oldSc ? kvRow('Incl. old service charge', tk(r.oldSc) + ' Tk') : '') +
           (r.scSkipped ? kvRow('Service charge', '<span style="color:var(--red)">not paid now: shows as due</span>', true) : '') +
           (r.smsPending ? '<div class="kv"><span class="l">SMS</span><span class="v muted" id="smsst">sending…</span></div>' : (r.sms && !r.waOnly ? kvRow('SMS', r.sms) : '')) +
-          (r.wa ? '<a class="btn ' + (r.waOnly ? '' : 'sec') + '" style="background:' + (r.waOnly ? '#25D366' : '') + '" href="' + esc(r.wa) + '" target="_blank" rel="noopener">💬 Send on WhatsApp' + (r.waOnly ? ' (no SMS for this number)' : '') + '</a>' : '') +
-          '<button class="btn sec" id="shr">🧾 Share receipt image</button><button class="btn" id="newp">New payment</button><a class="btn sec" href="#/ledger/' + esc(r.mid) + '">View ledger</a></div>';
+          (r.wa ? '<a class="btn ' + (r.waOnly ? '' : 'sec') + '" style="background:' + (r.waOnly ? '#25D366' : '') + '" href="' + esc(r.wa) + '" target="_blank" rel="noopener">Send on WhatsApp' + (r.waOnly ? ' (no SMS for this number)' : '') + '</a>' : '') +
+          '<button class="btn sec" id="shr">Share receipt image</button><button class="btn" id="newp">New payment</button><a class="btn sec" href="#/ledger/' + esc(r.mid) + '">View ledger</a></div>';
         $('#shr').onclick = () => shareReceipt({ receipt: r.receipt, member: r.mid + ' · ' + r.name, forText: r.months.length > 1 ? r.months[0] + ' to ' + r.months[r.months.length - 1] + ' (' + r.months.length + ' months)' : r.months[0], date: dateTxt, collectedBy: cbv, amount: r.total });
         $('#newp').onclick = () => again('member');
         window.scrollTo(0, 0);
@@ -542,12 +608,12 @@
   function viewMore() {
     const admin = state.user && state.user.role === 'admin';
     const links = [];
-    if (admin) links.push(['#/member', '➕ Add member'], ['#/users', '👤 Users & account linking']);
-    if (can('expenses')) links.push(['#/expenses', '💸 Expenses']);
-    if (isStaff()) links.push(['#/cash', '🏦 Cash book (Cash / Bank / bKash)']);
-    if (isStaff()) links.push(['#/scdue', '🧮 Service charge due'], ['#/report', '📄 Monthly report']);
-    if (admin) links.push(['#/reminders', '🔔 Due reminders'], ['#/health', '🩺 Data check'], ['#/backups', '🗄️ Backups']);
-    view.innerHTML = '<h2>' + (isStaff() ? 'More' : 'Settings') + '</h2>' + (links.length ? '<div class="card list">' + links.map(([h, l]) => '<a class="item" href="' + h + '" style="color:inherit;text-decoration:none"><span class="t">' + l + '</span><span class="muted">›</span></a>').join('') + '</div>' : '') +
+    if (admin) links.push(['#/member', 'Add member'], ['#/users', 'Users & account linking']);
+    if (can('expenses')) links.push(['#/expenses', 'Expenses']);
+    if (isStaff()) links.push(['#/cash', 'Cash book (Cash / Bank / bKash)']);
+    if (isStaff()) links.push(['#/scdue', 'Service charge due'], ['#/report', 'Monthly report']);
+    if (admin) links.push(['#/reminders', 'Due reminders'], ['#/health', 'Data check'], ['#/backups', 'Backups']);
+    view.innerHTML = '<h2>' + (isStaff() ? 'More' : 'Settings') + '</h2><div class="card who2"><div><div class="t">' + esc(state.user.name) + '</div><div class="muted">' + esc(state.user.id) + ' · ' + esc(state.user.role) + '</div></div><span class="chip ok">logged in</span></div>' + (links.length ? '<div class="card list">' + links.map(([h, l]) => '<a class="item" href="' + h + '" style="color:inherit;text-decoration:none"><span class="t">' + l + '</span><span class="muted">›</span></a>').join('') + '</div>' : '') +
       '<div class="card" style="margin-top:16px"><b>Change PIN</b><label>Current PIN</label><input id="op" type="password" inputmode="numeric" maxlength="6"><label>New PIN (6 digits)</label><input id="np" type="password" inputmode="numeric" maxlength="6"><button class="btn" id="cp">Change PIN</button><div id="cerr" class="err"></div></div>' +
       '<button class="btn sec" id="lo">Log out</button>' +
       '<p class="muted">To install: open the browser menu and choose “Add to Home screen”.</p>';
@@ -578,14 +644,14 @@
       (mid ? '' : '<p class="muted">The next Member ID is picked automatically. The member appears on the Dashboard straight away.</p>');
     $('#save').onclick = async () => {
       const f = {}; view.querySelectorAll('[data-f]').forEach((i) => { f[i.dataset.f] = i.value.trim(); });
-      if (!f.name) { $('#ferr').textContent = 'Name is required'; return; }
+      if (!f.name) { $('#ferr').textContent = 'Name is required'; view.querySelector('[data-f="name"]').focus(); return; }
       const b = $('#save'); b.disabled = true; b.textContent = 'Saving…';
       try {
         if (mid) { await api('updateMember', { mid, fields: f }); toast('Saved'); location.hash = '#/profile/' + mid; return; }
         const r = await api('addMember', { fields: f, holderUserId: $('#holder').value.trim().toUpperCase(), sendPin: $('#sendpin').checked });
         state.accounts = null;
         view.innerHTML = '<div class="card"><h2>✅ Member added</h2><div class="kv"><span class="l">Member ID</span><span class="v">' + esc(r.mid) + '</span></div>' +
-          (r.pin ? '<div class="kv"><span class="l">First PIN</span><span class="v">' + esc(r.pin.pin) + '</span></div><div class="kv"><span class="l">SMS</span><span class="v muted">' + esc(r.pin.waOnly ? 'foreign number, use WhatsApp' : r.pin.sms || '-') + '</span></div>' + (r.pin.wa ? '<a class="btn sec" target="_blank" rel="noopener" href="' + esc(r.pin.wa) + '">💬 Send PIN on WhatsApp</a>' : '') : '') +
+          (r.pin ? '<div class="kv"><span class="l">First PIN</span><span class="v">' + esc(r.pin.pin) + '</span></div><div class="kv"><span class="l">SMS</span><span class="v muted">' + esc(r.pin.waOnly ? 'foreign number, use WhatsApp' : r.pin.sms || '-') + '</span></div>' + (r.pin.wa ? '<a class="btn sec" target="_blank" rel="noopener" href="' + esc(r.pin.wa) + '">Send PIN on WhatsApp</a>' : '') : '') +
           '<a class="btn" href="#/pay/' + esc(r.mid) + '">Take first payment</a><button type="button" class="btn sec" id="addmore">Add another</button></div>';
         $('#addmore').onclick = () => viewMemberForm([]);
       } catch (e) { $('#ferr').textContent = e.message; b.disabled = false; b.textContent = mid ? 'Save changes' : 'Add member'; }
@@ -668,6 +734,8 @@
       view.querySelectorAll('[data-fund]').forEach((b) => b.onclick = () => { fund = b.dataset.fund; view.querySelectorAll('[data-fund]').forEach((x) => x.classList.toggle('on', x === b)); });
       if ($('#esave')) $('#esave').onclick = async () => {
         const amt = Number($('#ea').value || 0);
+        if (!$('#ep').value.trim()) { $('#eerr').textContent = 'Enter the purpose'; $('#ep').focus(); return; }
+        if (!(amt > 0)) { $('#eerr').textContent = 'Enter an amount'; $('#ea').focus(); return; }
         if (!await ask('Save ' + tk(amt) + ' Tk expense from the ' + fund + ' fund?')) return;
         const sb = $('#esave'); sb.disabled = true; sb.textContent = 'Saving…'; $('#eerr').textContent = '';
         try { const r = await api('addExpense', { fund, purpose: $('#ep').value, amount: amt, date: $('#ed').value, paidFrom: $('#ef').value, remarks: $('#er').value }); if (r.pending) await info('Saved for approval. This is a big amount, so a different admin or management member must approve it before it counts.'); else toast('Saved ' + r.voucher); viewExpenses(); }
@@ -789,7 +857,7 @@
         '<h3>Money out</h3><div class="card">' + kv('Somiti expenses', tk(e.Somiti) + ' Tk') + kv('Mosjid expenses', tk(e.Mosjid) + ' Tk') + kv('Member withdrawals', tk(e.Withdrawal || 0) + ' Tk') + kv('Voided entries', r.voided) + '</div>' +
         (r.balances ? '<h3>Balances now</h3><div class="card">' + Object.keys(r.balances).map((a) => kv(a, tk(r.balances[a]) + ' Tk')).join('') + '</div>' : '') +
         '<h3>Members</h3><div class="card">' + kv('New members', r.newMembers.length ? r.newMembers.join(', ') : 'none') + kv('Members due', r.due.length) + kv('Inactive (6+ months)', r.due.filter((x) => x.inactive).length) + '</div>' +
-        '<button class="btn" id="rpdf">⬇ Download PDF</button>';
+        '<button class="btn" id="rpdf">Download PDF</button>';
       $('#ym').onchange = () => { location.hash = '#/report/' + $('#ym').value; };
       $('#rpdf').onclick = async () => {
         try {
@@ -832,7 +900,11 @@
           p.otherAccounts.length ? '<div class="card" style="background:var(--redbg)">⚠️ This member is Account Holder for ' + esc(p.otherAccounts.join(', ')) + '. Move those accounts to another holder first (More › Users › Link / transfer).</div>' :
           '<div class="card"><label>Paid to</label><input id="pto" value="' + esc(p.name) + '"><div class="muted">' + (p.nominee ? 'Nominee: ' + esc(p.nominee) : 'No nominee recorded') + '</div><label>Paid from</label><select id="pfrom">' + moneyOpts(money) + '</select><label>Date</label><input id="pdate" type="date" value="' + today() + '"><label>Reason</label><input id="prs" placeholder="e.g. Member left / passed away (paid to nominee)"><button class="btn" id="pgo" style="background:var(--red)">Close account & record payout</button><div id="perr" class="err"></div></div>');
       if ($('#pgo')) $('#pgo').onclick = async () => {
-        if (!await ask('Close ' + p.mid + ' and pay back ' + tk(p.deposits) + ' Tk to ' + $('#pto').value + '?\nTheir login will be switched off. This cannot be undone from the app.')) return;
+        if (!$('#prs').value.trim()) { $('#perr').textContent = 'Reason is required'; $('#prs').focus(); return; }
+        const cf = await sheet({ title: 'Close ' + p.mid + '?', danger: true, ok: 'Close account', text: 'Pay back ' + tk(p.deposits) + ' Tk to ' + $('#pto').value + '.\nTheir login will be switched off. This cannot be undone from the app.',
+          fields: [{ id: 'c', label: 'Type ' + p.mid + ' to confirm', required: true, placeholder: p.mid }] });
+        if (!cf) return;
+        if (cf.c.toUpperCase() !== p.mid) { toast('Member ID did not match. Nothing was closed.', 5000); return; }
         try {
           const r = await api('closeAccount', { mid, paidTo: $('#pto').value, paidFrom: $('#pfrom').value, date: $('#pdate').value, reason: $('#prs').value, confirmAmount: p.deposits }); state.accounts = null;
           view.innerHTML = '<div class="card"><h2>✅ Account closed</h2><div class="kv"><span class="l">Paid</span><span class="v">' + tk(r.paid) + ' Tk</span></div><div class="kv"><span class="l">Voucher</span><span class="v">' + esc(r.voucher) + '</span></div><div class="kv"><span class="l">Paid to</span><span class="v">' + esc(r.paidTo) + '</span></div><a class="btn" href="#/accounts">Back to accounts</a></div>';

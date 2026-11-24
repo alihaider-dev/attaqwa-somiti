@@ -98,3 +98,24 @@ details.more summary{color:var(--g);font-weight:600;min-height:44px;display:flex
 a.tile:active{background:var(--g2)}
 /* update notice */
 .upd{position:fixed;left:16px;right:16px;top:calc(64px + env(safe-area-inset-top));z-index:15;min-height:48px;border:0;border-radius:12px;background:#1d2421;color:#fff;font:inherit;font-weight:700;box-shadow:0 6px 20px rgba(0,0,0,.3)}
+
+/* nav icons */
+.nav a .i{display:flex;justify-content:center;height:24px}
+.ic{width:22px;height:22px}
+.nav a{min-height:52px}
+/* loading skeleton */
+.skel{padding-top:4px}
+.sk{border-radius:var(--r);background:linear-gradient(90deg,#e9eeeb 25%,#f3f6f4 37%,#e9eeeb 63%);background-size:400% 100%;animation:sk 1.4s ease infinite;margin-bottom:12px}
+.sk.h{height:26px;width:45%;border-radius:8px}.sk.c{height:120px}.sk.c.s{height:64px}
+@keyframes sk{0%{background-position:100% 50%}100%{background-position:0 50%}}
+@media (prefers-reduced-motion:reduce){.sk{animation:none}.btn:active{transform:none}}
+/* offline bar */
+.offl{position:fixed;left:0;right:0;bottom:calc(58px + env(safe-area-inset-bottom));z-index:6;background:#8a5a00;color:#fff;font-size:13px;font-weight:600;text-align:center;padding:8px 12px}
+/* ledger actions, quiet link, who card */
+.acts{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 4px}
+.quiet{color:var(--mut);font-size:13px;display:inline-block;padding:12px}
+.who2{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.who2 .t{font-weight:700}
+div[data-mid]:focus-visible{outline-offset:-2px}
+.kv .v,.item .t,.ent b{overflow-wrap:anywhere}
+.item>div:first-child,.ent>div:first-child{min-width:0}
