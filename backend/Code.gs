@@ -287,6 +287,7 @@ function doPost(e) {
         accounts: () => accounts_(u),
         ledger: () => ledger_(u, b.mid),
         preview: () => { if (!can_(u, 'payments')) throw new Error('Not allowed'); return preview_(b.mid, b.count); },
+        payInit: () => payInit_(u),
         addPayment: () => addPayment_(u, b),
         addMosjid: () => addMosjid_(u, b),
         transactions: () => { if (!isStaff_(u)) throw new Error('Not allowed'); return transactions_(b.limit || 50); },
@@ -463,7 +464,15 @@ function accounts_(u) {
   const mine = isStaff_(u) ? null : new Set(myMids_(u));
   const lim = num_(getSettings_().INACTIVE_AFTER_MONTHS) || 6;
   const sc = scDueMap_();
-  return dash.filter(m => !mine || mine.has(m.mid)).map(m => Object.assign({ holder: holderOf[m.mid] || '', inactive: dueMonths_(m.status) >= lim, scOwed: sc[m.mid] ? sc[m.mid].amount : 0, scMonths: sc[m.mid] ? sc[m.mid].months.length : 0 }, m));
+  // nextKey = the first unpaid month (year * 12 + month), so the phone can show the months without asking the server.
+  const lastKey = {}; receiveRows_().forEach(r => { if (r.forMonth) { const k = monthKey_(r.forMonth); if (!(r.mid in lastKey) || k > lastKey[r.mid]) lastKey[r.mid] = k; } });
+  const startKey = monthKey_(startMonth_());
+  return dash.filter(m => !mine || mine.has(m.mid)).map(m => Object.assign({ holder: holderOf[m.mid] || '', inactive: dueMonths_(m.status) >= lim, scOwed: sc[m.mid] ? sc[m.mid].amount : 0, scMonths: sc[m.mid] ? sc[m.mid].months.length : 0, nextKey: m.mid in lastKey ? lastKey[m.mid] + 1 : startKey }, m));
+}
+/** Everything the payment screen needs, in ONE call. */
+function payInit_(u) {
+  if (!can_(u, 'payments')) throw new Error('Not allowed');
+  return { accounts: accounts_(u), money: moneyAccounts_(), collectors: collectorNames_(), deposit: monthlyDeposit_(), sc: num_(getSettings_().SERVICE_CHARGE_PER_MONTH) };
 }
 
 function dueMonths_(status) { const m = String(status || '').match(/^(\d+)\s*Due/i); return m ? Number(m[1]) : 0; }
@@ -571,7 +580,7 @@ function addPayment_(u, b) {
     const sc = b.scPaid === false ? 0 : scRate; // member may pay the service charge later
     const dep = monthlyDeposit_();
     const nm = nextMonths_(mid, count); // re-check inside the lock
-    if (b.expectFirst && fmtMonth_(nm.months[0]) !== b.expectFirst) throw new Error('Months changed since preview (someone else saved). Please preview again.');
+    if (b.expectFirst && fmtMonth_(nm.months[0]) !== b.expectFirst) throw new Error('Months changed: someone else saved a payment for this member. The form was refreshed. Check and save again.');
     const receipt = nextReceipt_();
     const now = new Date();
     const acct = checkAccount_(b.account);

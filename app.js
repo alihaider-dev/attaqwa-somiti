@@ -18,7 +18,7 @@
 
   /* ---------- API ---------- */
   // Speed: read-only screens show the last saved copy instantly, then refresh in the background.
-  const CACHEABLE = ['scDue', 'scHistory', 'dashboard', 'accounts', 'ledger', 'transactions', 'expenses', 'cashbook', 'profile', 'moneyAccounts', 'users', 'collectorNames', 'pending', 'monthReport'];
+  const CACHEABLE = ['payInit', 'scDue', 'scHistory', 'dashboard', 'accounts', 'ledger', 'transactions', 'expenses', 'cashbook', 'profile', 'moneyAccounts', 'users', 'collectorNames', 'pending', 'monthReport'];
   const fresh = {};
   // True once the user has typed or picked something on the current screen: then a background refresh must not redraw it.
   let dirty = false;
@@ -83,6 +83,48 @@
     const t = $('#toast'); t.textContent = msg; t.classList.remove('hidden');
     clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.add('hidden'), ms || 3000);
   }
+  /* In-app bottom sheet. Resolves null when cancelled, an object of field values (or true) when confirmed, or the chosen item. */
+  function sheet(o) {
+    return new Promise((done) => {
+      const w = document.createElement('div'); w.className = 'ov';
+      const fields = (o.fields || []).map((x) => '<label for="sh_' + x.id + '">' + esc(x.label) + '</label>' + (x.options
+        ? '<select id="sh_' + x.id + '">' + x.options.map(([v, l]) => '<option value="' + esc(v) + '"' + (v === x.value ? ' selected' : '') + '>' + esc(l) + '</option>').join('') + '</select>'
+        : '<input id="sh_' + x.id + '" type="' + (x.type || 'text') + '"' + (x.inputmode ? ' inputmode="' + x.inputmode + '"' : '') + ' value="' + esc(x.value || '') + '" placeholder="' + esc(x.placeholder || '') + '" autocomplete="off">')).join('');
+      w.innerHTML = '<div class="sheet" role="dialog" aria-modal="true" aria-label="' + esc(o.title || '') + '"><h2>' + esc(o.title || '') + '</h2>' +
+        (o.text ? '<div class="shtext">' + esc(o.text).replace(/\n/g, '<br>') + '</div>' : '') + (o.html || '') + fields +
+        (o.copy ? '<button type="button" class="btn sec" id="sh_copy">Copy</button>' : '') + '<div class="err" id="sh_err" role="alert"></div>' +
+        (o.items ? o.items.map((it, i) => '<button type="button" class="btn sec" data-i="' + i + '"' + (it.danger ? ' style="color:var(--red)"' : '') + '>' + esc(it.label) + '</button>').join('')
+          : '<button type="button" class="btn' + (o.danger ? ' danger' : '') + '" id="sh_ok">' + esc(o.ok || 'OK') + '</button>') +
+        (o.cancel === false ? '' : '<button type="button" class="btn sec" id="sh_no">' + esc(o.cancel || 'Cancel') + '</button>') + '</div>';
+      document.body.appendChild(w);
+      const q = (sel) => w.querySelector(sel);
+      const key = (e) => { if (e.key === 'Escape') close(null); };
+      const close = (v) => { document.removeEventListener('keydown', key); w.remove(); done(v); };
+      document.addEventListener('keydown', key);
+      w.onclick = (e) => { if (e.target === w && o.cancel !== false) close(null); };
+      if (q('#sh_no')) q('#sh_no').onclick = () => close(null);
+      if (q('#sh_copy')) q('#sh_copy').onclick = async () => { try { await navigator.clipboard.writeText(o.copy); q('#sh_copy').textContent = 'Copied ✓'; } catch (e) { q('#sh_copy').textContent = 'Could not copy: write it down'; } };
+      w.querySelectorAll('[data-i]').forEach((b) => b.onclick = () => close(o.items[+b.dataset.i]));
+      if (q('#sh_ok')) q('#sh_ok').onclick = () => {
+        const out = {};
+        for (const x of (o.fields || [])) {
+          const v = q('#sh_' + x.id).value.trim();
+          if (x.required && !v) { q('#sh_err').textContent = x.label + ' is required'; q('#sh_' + x.id).focus(); return; }
+          out[x.id] = v;
+        }
+        close((o.fields || []).length ? out : true);
+      };
+      const first = q('input,select'); if (first && o.focus !== false) setTimeout(() => first.focus(), 50);
+    });
+  }
+  const ask = (text, okLabel, danger) => sheet({ title: 'Please confirm', text, ok: okLabel || 'Yes, continue', danger }).then((v) => !!v);
+  const info = (text, title) => sheet({ title: title || 'Note', text, ok: 'OK', cancel: false });
+  const showPin = (id, pin, extra) => sheet({ title: 'First PIN for ' + id, html: '<div class="pin">' + esc(pin) + '</div><div class="shtext">' + esc(extra || '').replace(/\n/g, '<br>') + '<br>They must set their own PIN at first login.</div>', copy: pin, ok: 'Done', cancel: false });
+  const rowMenu = async (title, items) => { const it = await sheet({ title, items, cancel: 'Close' }); if (it && it.run) it.run(); };
+  const kvRow = (l, v, raw) => '<div class="kv"><span class="l">' + esc(l) + '</span><span class="v">' + (raw ? v : esc(v)) + '</span></div>';
+  const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const monthLabel = (k) => MON[k % 12] + '-' + Math.floor(k / 12);
+
   function busy(text) { dirty = false; view.innerHTML = '<div class="loading">' + esc(text || 'Loading…') + '</div>'; }
   function fail(e) { view.innerHTML = '<div class="card"><b>Could not load</b><div class="err">' + esc(e.message) + '</div><button class="btn sec" onclick="location.reload()">Try again</button></div>'; }
 
@@ -115,13 +157,12 @@
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = file.name; a.click();
   }
   async function voidFlow(payload, what, after) {
-    const reason = (prompt('VOID ' + what + '\nThis removes it from the totals (a copy is kept in App_Voided).\n\nReason (required):') || '').trim();
-    if (!reason) return;
+    const f = await sheet({ title: 'Void entry', text: what + '\n\nThis removes it from the totals. A copy is kept in App_Voided.', fields: [{ id: 'reason', label: 'Reason', required: true, placeholder: 'Why is this entry wrong?' }], ok: 'Void it', danger: true });
+    if (!f) return;
+    const reason = f.reason;
     try { const r = await api('voidEntry', Object.assign({ reason }, payload)); toast('Voided ' + r.voided + ' row(s), ' + tk(r.total) + ' Tk' + (r.scUndone ? ' (incl. ' + tk(r.scUndone) + ' Tk old service charge, now due again)' : ''), 5000); state.accounts = null; after && after(); }
     catch (e) { toast(e.message, 5000); }
   }
-  let collectorCache = null;
-  async function collectorList() { if (!collectorCache) { try { collectorCache = await api('collectorNames'); } catch (e) { collectorCache = []; } } return collectorCache; }
 
   /* ---------- nav ---------- */
   function navItems() {
@@ -223,8 +264,8 @@
       const due = d.members.filter((m) => /due/i.test(m.status));
       view.innerHTML = '<h2>Dashboard</h2>' + d.left.map(sec).join('') + d.right.map(sec).join('') +
         '<h3>Members with dues (' + due.length + ')</h3><div class="card list">' +
-        (due.length ? due.map((m) => '<div class="item" data-mid="' + esc(m.mid) + '"><div><div class="t">' + esc(m.name) + '</div><div class="s">' + esc(m.mid) + ' · paid up to ' + esc(m.paidUpTo) + '</div></div>' + statusChip(m.status) + '</div>').join('') : '<div class="muted">Nobody is due 🎉</div>') + '</div>';
-      view.querySelectorAll('[data-mid]').forEach((el) => el.onclick = () => location.hash = '#/ledger/' + el.dataset.mid);
+        (due.length ? due.map((m) => '<div class="item" data-mid="' + esc(m.mid) + '"><div><div class="t">' + esc(m.name) + '</div><div class="s">' + esc(m.mid) + ' · paid up to ' + esc(m.paidUpTo) + '</div></div><div class="row">' + statusChip(m.status) + (can('payments') ? '<a class="btn sm" href="#/pay/' + esc(m.mid) + '" data-stop>Collect</a>' : '') + '</div></div>').join('') : '<div class="muted">Nobody is due 🎉</div>') + '</div>';
+      view.querySelectorAll('[data-mid]').forEach((el) => el.onclick = (ev) => { if (ev.target.closest('[data-stop]')) return; location.hash = '#/ledger/' + el.dataset.mid; });
     } catch (e) { fail(e); }
   }
 
@@ -276,13 +317,14 @@
           '<div class="kv"><span class="l">Status</span><span class="v">' + statusChip(s.status) + '</span></div>' +
           (L.scOwed ? '<div class="kv"><span class="l">Service charge due</span><span class="v" style="color:var(--red)">' + tk(L.scOwed) + ' Tk</span></div>' : '')
           : '<div class="kv"><span class="l">Total received</span><span class="v">' + tk(total) + ' Tk</span></div>') +
-        '</div><button class="btn sec" id="pdf">⬇ Download statement (PDF)</button>' +
+        '</div>' + (can('payments') && s.mid && L.mid !== 'ATFS-0000' ? '<a class="btn" href="#/pay/' + esc(L.mid) + '">➕ Collect payment</a>' : '') +
+        '<button class="btn sec" id="pdf">⬇ Download statement (PDF)</button>' +
         (L.mid !== 'ATFS-0000' ? '<a class="btn sec" href="#/profile/' + esc(L.mid) + '">👤 Member profile</a>' : '') +
-        (L.scOwed && can('payments') ? '<a class="btn" href="#/scdue/' + esc(L.mid) + '">Collect service charge due (' + tk(L.scOwed) + ' Tk)</a>' : '') +
+        (L.scOwed && can('payments') ? '<a class="btn sec" href="#/scdue/' + esc(L.mid) + '">Collect service charge due (' + tk(L.scOwed) + ' Tk)</a>' : '') +
         (L.donations && L.donations.length ? '<h3>Mosjid Fund donations (' + tk(L.donations.reduce((t, d) => t + d.amount, 0)) + ' Tk)</h3><div class="card">' + L.donations.map((d) => '<div class="ent"><div><b>' + esc(d.date) + '</b><div class="muted">' + esc(d.receipt) + '</div></div><div class="amt">' + tk(d.amount) + '</div></div>').join('') + '</div>' : '') +
         '<h3>History (' + L.entries.length + ')</h3><div class="card">' +
         (L.entries.map((e, i) => '<div class="ent"><div><b>' + esc(e.forMonth) + '</b><div class="muted">Paid ' + esc(e.date) + (e.receipt ? ' · ' + esc(e.receipt) : '') + (e.remarks ? ' · ' + esc(e.remarks) : '') + '</div>' +
-          '<div class="row" style="margin-top:4px;gap:6px">' + (e.receipt ? '<button class="btn sm sec" data-share="' + i + '">🧾 Receipt</button>' : '') + (state.user.role === 'admin' ? '<button class="btn sm sec" data-void="' + i + '" style="color:var(--red)">Void</button>' : '') + '</div></div>' +
+          '<div class="row" style="margin-top:4px;gap:6px">' + (e.receipt ? '<button class="btn sm sec" data-share="' + i + '">🧾 Receipt</button>' : '') + (state.user.role === 'admin' ? '<button class="btn sm sec" data-void="' + i + '" aria-label="More actions for ' + esc(e.forMonth) + '">⋯</button>' : '') + '</div></div>' +
           '<div class="amt">' + tk(e.deposit) + (e.sc ? '<div class="muted">+' + tk(e.sc) + ' SC</div>' : '') + '</div></div>').join('') || '<div class="muted">No entries yet</div>') + '</div>' +
         (state.user.role === 'admin' && L.mid !== 'ATFS-0000' && s.mid ? '<a class="btn sec" style="color:var(--red)" href="#/close/' + esc(L.mid) + '">Close account / withdrawal</a>' : '');
       $('#pdf').onclick = () => statementPdf(L);
@@ -294,7 +336,8 @@
         const e = L.entries[+b.dataset.void];
         const payload = e.receipt ? { tab: 'Receive', receipt: e.receipt } : { tab: 'Receive', row: e.row, mid: L.mid, forMonth: e.forMonth, deposit: e.deposit };
         const n = e.receipt ? L.entries.filter((x) => x.receipt === e.receipt).length : 1;
-        voidFlow(payload, e.receipt ? 'receipt ' + e.receipt + ' (' + n + ' month' + (n > 1 ? 's' : '') + ')' : e.forMonth + ' entry', () => viewLedger([L.mid]));
+        const what = e.receipt ? 'Receipt ' + e.receipt + ' (' + n + ' month' + (n > 1 ? 's' : '') + ')' : e.forMonth + ' entry';
+        rowMenu(what, [{ label: 'Void this ' + (e.receipt && n > 1 ? 'whole receipt' : 'entry') + '…', danger: true, run: () => voidFlow(payload, what, () => viewLedger([L.mid])) }]);
       });
     } catch (e) { fail(e); }
   }
@@ -327,102 +370,121 @@
   async function viewPay(args) {
     if (!can('payments')) { location.hash = '#/accounts'; return; }
     busy();
-    let list, money;
-    try { [list, money] = await Promise.all([loadAccounts(), moneyAccounts()]); } catch (e) { return fail(e); }
+    let init;
+    try { init = await api('payInit'); } catch (e) { return fail(e); }
+    const list = init.accounts, money = init.money;
     const mode = args[0] === 'mosjid' ? 'mosjid' : 'member';
-    const opts = list.map((a) => '<option value="' + esc(a.mid) + '">' + esc(a.mid + ' · ' + a.name) + '</option>').join('');
-    const common = '<label>Deposit date</label><input id="dd" type="date" value="' + today() + '">' +
-      '<label>Collected by</label><input id="cb" list="cbl" placeholder="Who received the money"><datalist id="cbl"></datalist>' +
-      '<label>Received into</label><select id="acct">' + moneyOpts(money) + '</select>';
-    view.innerHTML = '<h2>New Payment</h2><div class="tabs"><button class="' + (mode === 'member' ? 'on' : '') + '" onclick="location.hash=\'#/pay\'">Member deposit</button><button class="' + (mode === 'mosjid' ? 'on' : '') + '" onclick="location.hash=\'#/pay/mosjid\'">🕌 Mosjid Fund</button></div>' +
+    const pre = mode === 'member' && args[0] ? args[0] : '';
+    const lastCb = store.get('lastCb') || '', lastAcct = store.get('lastAcct') || '';
+    const opts = (sel) => list.map((a) => '<option value="' + esc(a.mid) + '"' + (a.mid === sel ? ' selected' : '') + '>' + esc(a.mid + ' · ' + a.name) + '</option>').join('');
+    const common = '<label for="dd">Deposit date</label><input id="dd" type="date" value="' + today() + '">' +
+      '<label for="cb">Collected by</label><input id="cb" list="cbl" value="' + esc(lastCb) + '" placeholder="Who received the money" autocomplete="off"><datalist id="cbl">' + (init.collectors || []).map((n) => '<option value="' + esc(n) + '">').join('') + '</datalist>' +
+      '<label for="acct">Received into</label><select id="acct">' + moneyOpts(money, lastAcct) + '</select>';
+    view.innerHTML = '<h2>New Payment</h2><div class="tabs"><button type="button" class="' + (mode === 'member' ? 'on' : '') + '" id="tmem">Member deposit</button><button type="button" class="' + (mode === 'mosjid' ? 'on' : '') + '" id="tmos">🕌 Mosjid Fund</button></div>' +
       '<div class="card">' + (mode === 'member'
-        ? '<label>Member</label><select id="mid"><option value="">Choose member…</option>' + opts + '</select>' +
+        ? '<label for="mid">Member</label><select id="mid"><option value="">Choose member…</option>' + opts(pre) + '</select>' +
           '<div id="minfo"></div>' +
-          '<label>Number of months</label><div class="stepper"><button type="button" id="minus">−</button><input id="cnt" type="number" min="1" max="60" value="1" inputmode="numeric"><button type="button" id="plus">+</button></div>' +
-          '<label style="display:flex;gap:8px;align-items:center;margin-top:14px;color:var(--ink)"><input type="checkbox" id="scnow" checked style="width:auto"> Service charge paid now</label>' +
-          '<label id="oldwrap" style="display:none;gap:8px;align-items:center;color:var(--ink)"><input type="checkbox" id="oldsc" style="width:auto"> <span id="oldtxt"></span></label>' +
-          common + '<label>Remarks (optional)</label><input id="rm">'
-        : '<label>Donors</label><div id="donors"></div><button type="button" class="btn sm sec" id="addd" style="margin-top:8px">+ Add donor</button>' +
-          '<div class="preview"><div class="kv"><span class="l">Total</span><span class="v total" id="dtot">0 Tk</span></div></div>' + common) +
-      '<div id="pv"></div><div id="perr" class="err"></div>' +
-      '<button class="btn" id="go">' + (mode === 'member' ? 'Preview' : 'Save donation') + '</button></div>';
+          '<label for="cnt">Number of months</label><div class="stepper"><button type="button" id="minus" aria-label="One month less">−</button><input id="cnt" type="number" min="1" max="60" value="1" inputmode="numeric"><button type="button" id="plus" aria-label="One month more">+</button></div>' +
+          '<label class="check"><input type="checkbox" id="scnow" checked> Service charge paid now</label>' +
+          '<label class="check" id="oldwrap" style="display:none"><input type="checkbox" id="oldsc"> <span id="oldtxt"></span></label>' +
+          common + '<details class="more"><summary>Add a remark</summary><label for="rm">Remarks</label><input id="rm" autocomplete="off"></details>'
+        : '<label>Donors</label><div id="donors"></div><button type="button" class="btn sm sec" id="addd" style="margin-top:8px">+ Add donor</button>' + common) +
+      '</div><div id="perr" class="err" role="alert"></div><div style="height:96px"></div>' +
+      '<div class="paybar"><div class="pb-l"><div class="muted" id="bsub">' + (mode === 'member' ? 'Choose a member' : 'Add a donor') + '</div><div class="total" id="btot">0 Tk</div></div><button type="button" class="btn" id="go" disabled>Save</button></div>';
+    $('#tmem').onclick = () => { if (mode !== 'member') location.hash = '#/pay'; };
+    $('#tmos').onclick = () => { if (mode !== 'mosjid') location.hash = '#/pay/mosjid'; };
+    const remember = () => { store.set('lastCb', $('#cb').value.trim()); store.set('lastAcct', $('#acct').value); };
+    const again = (m) => { if (location.hash === (m === 'mosjid' ? '#/pay/mosjid' : '#/pay')) viewPay(m === 'mosjid' ? ['mosjid'] : []); else location.hash = m === 'mosjid' ? '#/pay/mosjid' : '#/pay'; };
 
-    collectorList().then((l) => { const d = $('#cbl'); if (d) d.innerHTML = l.map((n) => '<option value="' + esc(n) + '">').join(''); });
     if (mode === 'mosjid') {
+      const rows = () => Array.from(document.querySelectorAll('#donors .row')).map((d) => ({ mid: d.querySelector('.dmid').value, name: d.querySelector('.dmid').value ? '' : d.querySelector('.dname').value.trim(), amount: Number(d.querySelector('.damt').value || 0) })).filter((x) => x.amount > 0);
+      const sum = () => { const r = rows(); const t = r.reduce((x, y) => x + y.amount, 0); $('#btot').textContent = tk(t) + ' Tk'; $('#bsub').textContent = r.length ? r.length + ' donor' + (r.length > 1 ? 's' : '') + ' · Mosjid Fund' : 'Add a donor'; $('#go').disabled = !t; };
       const donorRow = () => {
-        const d = document.createElement('div'); d.className = 'row'; d.style.marginTop = '8px';
-        d.style.flexWrap = 'wrap';
-        d.innerHTML = '<select class="dmid" style="flex:1 1 100%"><option value="">Other (type name)</option>' + opts + '</select><input class="dname" placeholder="Name" style="flex:2"><input class="damt" type="number" inputmode="numeric" placeholder="Tk" style="flex:1"><button type="button" class="btn sm sec drm">✕</button>';
-        d.querySelector('.dmid').onchange = (e) => { const n = d.querySelector('.dname'); n.style.display = e.target.value ? 'none' : ''; };
+        const d = document.createElement('div'); d.className = 'row'; d.style.marginTop = '8px'; d.style.flexWrap = 'wrap';
+        d.innerHTML = '<select class="dmid" style="flex:1 1 100%" aria-label="Donor"><option value="">Other (type name)</option>' + opts('') + '</select><input class="dname" placeholder="Name" aria-label="Donor name" style="flex:2" autocomplete="off"><input class="damt" type="number" inputmode="numeric" placeholder="Tk" aria-label="Amount in Taka" style="flex:1"><button type="button" class="btn sm sec drm" aria-label="Remove donor">✕</button>';
+        d.querySelector('.dmid').onchange = (e) => { d.querySelector('.dname').style.display = e.target.value ? 'none' : ''; };
         d.querySelector('.damt').oninput = sum;
         d.querySelector('.drm').onclick = () => { d.remove(); sum(); };
         $('#donors').appendChild(d);
       };
-      const rows = () => Array.from(document.querySelectorAll('#donors .row')).map((d) => ({ mid: d.querySelector('.dmid').value, name: d.querySelector('.dmid').value ? '' : d.querySelector('.dname').value.trim(), amount: Number(d.querySelector('.damt').value || 0) })).filter((x) => x.amount > 0);
-      function sum() { $('#dtot').textContent = tk(rows().reduce((t, x) => t + x.amount, 0)) + ' Tk'; }
       donorRow(); $('#addd').onclick = donorRow;
       $('#go').onclick = async () => {
         const b = $('#go'); $('#perr').textContent = '';
         const donors = rows(); const total = donors.reduce((t, x) => t + x.amount, 0);
-        if (!donors.length) { $('#perr').textContent = 'Add at least one donor with an amount'; return; }
-        if (!confirm('Save ' + tk(total) + ' Tk to Mosjid Fund from ' + donors.length + ' donor(s)?')) return;
+        if (!donors.length) return;
+        const yes = await sheet({ title: 'Save this donation?', html: '<div class="preview">' + donors.map((d) => kvRow(d.mid || d.name || '(no name)', tk(d.amount))).join('') + kvRow('Total to Mosjid Fund', '<span class="total">' + tk(total) + ' Tk</span>', true) + '</div>', ok: 'Save ' + tk(total) + ' Tk' });
+        if (!yes) return;
         b.disabled = true; b.textContent = 'Saving…';
         try {
+          remember();
           const r = await api('addMosjid', { donors, depositDate: $('#dd').value, collectedBy: $('#cb').value, account: $('#acct').value });
-          view.innerHTML = '<div class="card"><h2>✅ Saved</h2><div class="kv"><span class="l">Receipt</span><span class="v">' + esc(r.receipt) + '</span></div><div class="kv"><span class="l">Total</span><span class="v">' + tk(r.amount) + ' Tk</span></div><div class="kv"><span class="l">Donors</span><span class="v">' + esc(r.donors) + '</span></div><button class="btn sec" id="shr">🧾 Share receipt image</button><a class="btn sec" href="#/pay/mosjid" onclick="setTimeout(()=>location.reload(),50)">New entry</a></div>';
-          $('#shr').onclick = () => shareReceipt({ receipt: r.receipt, member: 'Mosjid Fund donation', forText: r.donors, date: new Date().toDateString(), amount: r.amount });
-        } catch (e) { $('#perr').textContent = e.message; b.disabled = false; b.textContent = 'Save donation'; }
+          const dateTxt = $('#dd').value;
+          view.innerHTML = '<div class="card"><h2>✅ Saved</h2>' + kvRow('Receipt', r.receipt) + kvRow('Total', tk(r.amount) + ' Tk') + kvRow('Donors', r.donors) + '<button class="btn sec" id="shr">🧾 Share receipt image</button><button class="btn" id="newp">New entry</button></div>';
+          $('#shr').onclick = () => shareReceipt({ receipt: r.receipt, member: 'Mosjid Fund donation', forText: r.donors, date: dateTxt, amount: r.amount });
+          $('#newp').onclick = () => again('mosjid');
+        } catch (e) { $('#perr').textContent = e.message; toast(e.message, 6000); b.disabled = false; b.textContent = 'Save'; }
       };
       return;
     }
 
-    let pv = null;
-    const reset = () => { pv = null; $('#pv').innerHTML = ''; $('#go').textContent = 'Preview'; };
-    const showMember = () => {
-      reset();
-      const a = list.find((x) => x.mid === $('#mid').value);
-      if (!a) { $('#minfo').innerHTML = ''; $('#oldwrap').style.display = 'none'; return; }
-      const due = (String(a.status).match(/^(\d+)\s*Due/i) || [])[1];
-      $('#minfo').innerHTML = '<div class="preview" style="margin-top:10px"><div class="kv"><span class="l">Paid up to</span><span class="v">' + esc(a.paidUpTo) + '</span></div><div class="kv"><span class="l">Status</span><span class="v">' + statusChip(a.status) + '</span></div>' +
-        (due ? '<div class="kv"><span class="l">Due amount</span><span class="v" style="color:var(--red)">' + tk(Number(due) * 1000) + ' Tk (' + due + ' months)</span></div>' : '') +
-        (a.scOwed ? '<div class="kv"><span class="l">Service charge due</span><span class="v" style="color:var(--red)">' + tk(a.scOwed) + ' Tk (' + a.scMonths + ' months)</span></div>' : '') + '</div>';
-      $('#cnt').value = due ? Math.min(60, Number(due)) : 1;
-      if (a.scOwed) { $('#oldwrap').style.display = 'flex'; $('#oldsc').checked = false; $('#oldtxt').textContent = 'Also collect old service charge due (' + tk(a.scOwed) + ' Tk)'; } else { $('#oldwrap').style.display = 'none'; $('#oldsc').checked = false; }
+    // Member deposit: months and total are worked out on the phone (rates and next month came with payInit). The server checks again when saving.
+    const calc = () => {
+      const a = list.find((x) => x.mid === $('#mid').value); if (!a) return null;
+      const n = Math.max(1, Math.min(60, Math.floor(+$('#cnt').value || 1)));
+      const months = []; for (let i = 0; i < n; i++) months.push(monthLabel(a.nextKey + i));
+      const scNow = $('#scnow').checked; const old = $('#oldsc').checked ? (a.scOwed || 0) : 0;
+      return { a, n, months, scNow, old, dep: init.deposit * n, sc: scNow ? init.sc * n : 0, total: init.deposit * n + (scNow ? init.sc * n : 0) + old };
     };
-    $('#mid').onchange = showMember; $('#cnt').oninput = reset; $('#scnow').onchange = reset; $('#oldsc').onchange = reset;
-    $('#minus').onclick = () => { $('#cnt').value = Math.max(1, (+$('#cnt').value || 1) - 1); reset(); };
-    $('#plus').onclick = () => { $('#cnt').value = Math.min(60, (+$('#cnt').value || 1) + 1); reset(); };
+    const paint = () => {
+      const c = calc(); $('#perr').textContent = '';
+      if (!c) { $('#bsub').textContent = 'Choose a member'; $('#btot').textContent = '0 Tk'; $('#go').disabled = true; return; }
+      $('#bsub').textContent = c.n === 1 ? c.months[0] : c.months[0] + ' → ' + c.months[c.n - 1] + ' (' + c.n + ' months)';
+      $('#btot').textContent = tk(c.total) + ' Tk'; $('#go').disabled = false;
+    };
+    const showMember = () => {
+      const a = list.find((x) => x.mid === $('#mid').value);
+      if (!a) { $('#minfo').innerHTML = ''; $('#oldwrap').style.display = 'none'; $('#oldsc').checked = false; paint(); return; }
+      const due = (String(a.status).match(/^(\d+)\s*Due/i) || [])[1];
+      $('#minfo').innerHTML = '<div class="preview" style="margin-top:10px">' + kvRow('Paid up to', a.paidUpTo) + kvRow('Status', statusChip(a.status), true) +
+        (due ? kvRow('Due amount', '<span style="color:var(--red)">' + tk(Number(due) * init.deposit) + ' Tk (' + due + ' months)</span>', true) : '') +
+        (a.scOwed ? kvRow('Service charge due', '<span style="color:var(--red)">' + tk(a.scOwed) + ' Tk (' + a.scMonths + ' months)</span>', true) : '') + '</div>';
+      $('#cnt').value = due ? Math.min(60, Number(due)) : 1;
+      $('#oldsc').checked = false;
+      if (a.scOwed) { $('#oldwrap').style.display = ''; $('#oldtxt').textContent = 'Also collect old service charge due (' + tk(a.scOwed) + ' Tk)'; } else $('#oldwrap').style.display = 'none';
+      paint();
+    };
+    $('#mid').onchange = showMember; $('#cnt').oninput = paint; $('#scnow').onchange = paint; $('#oldsc').onchange = paint;
+    $('#minus').onclick = () => { $('#cnt').value = Math.max(1, (+$('#cnt').value || 1) - 1); paint(); };
+    $('#plus').onclick = () => { $('#cnt').value = Math.min(60, (+$('#cnt').value || 1) + 1); paint(); };
+    if (pre) showMember();
     $('#go').onclick = async () => {
-      const b = $('#go'); $('#perr').textContent = '';
-      const mid = $('#mid').value; if (!mid) { $('#perr').textContent = 'Choose a member'; return; }
-      b.disabled = true;
+      const b = $('#go'); const c = calc(); if (!c) return;
+      const yes = await sheet({ title: 'Save this payment?', focus: false, html: '<div class="preview">' + kvRow('Member', c.a.mid + ' · ' + c.a.name) +
+        kvRow('Months', (c.n === 1 ? c.months[0] : c.months[0] + ' → ' + c.months[c.n - 1]) + ' (' + c.n + ')') +
+        kvRow('Deposit', tk(init.deposit) + ' × ' + c.n + ' = ' + tk(c.dep)) +
+        kvRow('Service charge', c.scNow ? tk(init.sc) + ' × ' + c.n + ' = ' + tk(c.sc) : '<span style="color:var(--red)">not paid now (' + tk(init.sc * c.n) + ' Tk will show as due)</span>', true) +
+        (c.old ? kvRow('Old service charge', tk(c.old)) : '') + kvRow('Received into', $('#acct').value) +
+        kvRow('Total to collect', '<span class="total">' + tk(c.total) + ' Tk</span>', true) + '</div>', ok: 'Save ' + tk(c.total) + ' Tk' });
+      if (!yes) return;
+      b.disabled = true; b.textContent = 'Saving…'; $('#perr').textContent = '';
+      const mid = c.a.mid, cbv = $('#cb').value, dateTxt = $('#dd').value;
       try {
-        if (!pv) {
-          b.textContent = 'Checking…';
-          pv = await api('preview', { mid, count: $('#cnt').value });
-          const n = pv.months.length; const scNow = $('#scnow').checked; const old = $('#oldsc').checked ? (pv.scOwed || 0) : 0;
-          pv.grand = pv.deposit * n + (scNow ? pv.sc * n : 0) + old;
-          $('#pv').innerHTML = '<div class="preview"><div class="kv"><span class="l">Last paid</span><span class="v">' + esc(pv.lastPaid) + '</span></div>' +
-            '<div class="kv"><span class="l">Months</span><span class="v">' + esc(n === 1 ? pv.months[0] : pv.months[0] + ' → ' + pv.months[n - 1]) + ' (' + n + ')</span></div>' +
-            '<div class="kv"><span class="l">Deposit</span><span class="v">' + tk(pv.deposit) + ' × ' + n + ' = ' + tk(pv.deposit * n) + '</span></div>' +
-            '<div class="kv"><span class="l">Service charge</span><span class="v">' + (scNow ? tk(pv.sc) + ' × ' + n + ' = ' + tk(pv.sc * n) : '<span style="color:var(--red)">not paid now (' + tk(pv.sc * n) + ' Tk will show as due)</span>') + '</span></div>' +
-            (old ? '<div class="kv"><span class="l">Old service charge</span><span class="v">' + tk(old) + '</span></div>' : '') +
-            '<div class="kv"><span class="l">Total to collect</span><span class="v total">' + tk(pv.grand) + ' Tk</span></div></div>';
-          b.textContent = 'Confirm & save'; b.disabled = false;
-        } else {
-          b.textContent = 'Saving…';
-          const cbIn = $('#cb').value;
-          const r = await api('addPayment', { mid, count: pv.months.length, expectFirst: pv.months[0], depositDate: $('#dd').value, collectedBy: $('#cb').value, remarks: $('#rm').value, account: $('#acct').value, scPaid: $('#scnow').checked, collectOldSc: $('#oldsc').checked });
-          state.accounts = null;
-          view.innerHTML = '<div class="card"><h2>✅ Saved</h2><div class="kv"><span class="l">Receipt</span><span class="v">' + esc(r.receipt) + '</span></div><div class="kv"><span class="l">Member</span><span class="v">' + esc(r.mid + ' · ' + r.name) + '</span></div><div class="kv"><span class="l">Months</span><span class="v">' + esc(r.months.join(', ')) + '</span></div><div class="kv"><span class="l">Total</span><span class="v">' + tk(r.total) + ' Tk</span></div>' +
-            (r.oldSc ? '<div class="kv"><span class="l">Incl. old service charge</span><span class="v">' + tk(r.oldSc) + ' Tk</span></div>' : '') +
-            (r.scSkipped ? '<div class="kv"><span class="l">Service charge</span><span class="v" style="color:var(--red)">not paid now: shows as due</span></div>' : '') +
-            (r.sms && !r.waOnly ? '<div class="kv"><span class="l">SMS</span><span class="v muted">' + esc(r.sms) + '</span></div>' : '') +
-            (r.wa ? '<a class="btn ' + (r.waOnly ? '' : 'sec') + '" style="background:' + (r.waOnly ? '#25D366' : '') + '" href="' + esc(r.wa) + '" target="_blank" rel="noopener">💬 Send on WhatsApp' + (r.waOnly ? ' (no SMS for this number)' : '') + '</a>' : '') +
-            '<button class="btn sec" id="shr">🧾 Share receipt image</button><a class="btn" href="#/ledger/' + esc(r.mid) + '">View ledger</a><a class="btn sec" href="#/pay" onclick="setTimeout(()=>location.reload(),50)">New payment</a></div>';
-          const cbv = cbIn; $('#shr').onclick = () => shareReceipt({ receipt: r.receipt, member: r.mid + ' · ' + r.name, forText: r.months.length > 1 ? r.months[0] + ' to ' + r.months[r.months.length - 1] + ' (' + r.months.length + ' months)' : r.months[0], date: new Date().toDateString(), collectedBy: cbv, amount: r.total });
-        }
-      } catch (e) { $('#perr').textContent = e.message; b.disabled = false; b.textContent = pv ? 'Confirm & save' : 'Preview'; }
+        remember();
+        const r = await api('addPayment', { mid, count: c.n, expectFirst: c.months[0], depositDate: dateTxt, collectedBy: cbv, remarks: $('#rm').value, account: $('#acct').value, scPaid: c.scNow, collectOldSc: !!c.old });
+        state.accounts = null;
+        view.innerHTML = '<div class="card"><h2>✅ Saved</h2>' + kvRow('Receipt', r.receipt) + kvRow('Member', r.mid + ' · ' + r.name) + kvRow('Months', r.months.join(', ')) + kvRow('Total', tk(r.total) + ' Tk') +
+          (r.oldSc ? kvRow('Incl. old service charge', tk(r.oldSc) + ' Tk') : '') +
+          (r.scSkipped ? kvRow('Service charge', '<span style="color:var(--red)">not paid now: shows as due</span>', true) : '') +
+          (r.sms && !r.waOnly ? kvRow('SMS', r.sms) : '') +
+          (r.wa ? '<a class="btn ' + (r.waOnly ? '' : 'sec') + '" style="background:' + (r.waOnly ? '#25D366' : '') + '" href="' + esc(r.wa) + '" target="_blank" rel="noopener">💬 Send on WhatsApp' + (r.waOnly ? ' (no SMS for this number)' : '') + '</a>' : '') +
+          '<button class="btn sec" id="shr">🧾 Share receipt image</button><button class="btn" id="newp">New payment</button><a class="btn sec" href="#/ledger/' + esc(r.mid) + '">View ledger</a></div>';
+        $('#shr').onclick = () => shareReceipt({ receipt: r.receipt, member: r.mid + ' · ' + r.name, forText: r.months.length > 1 ? r.months[0] + ' to ' + r.months[r.months.length - 1] + ' (' + r.months.length + ' months)' : r.months[0], date: dateTxt, collectedBy: cbv, amount: r.total });
+        $('#newp').onclick = () => again('member');
+        window.scrollTo(0, 0);
+      } catch (e) {
+        if (/Months changed/.test(e.message)) { clearCache(); toast(e.message, 7000); viewPay([mid]); return; }
+        $('#perr').textContent = e.message; toast(e.message, 6000); b.disabled = false; b.textContent = 'Save';
+      }
     };
   }
 
@@ -432,10 +494,11 @@
       const t = await api('transactions', { limit: 100 });
       view.innerHTML = '<h2>Recent activity</h2><div class="card">' + t.map((e, i) =>
         '<div class="ent"><div><b>' + esc(e.name) + '</b> <span class="muted">' + esc(e.mid) + '</span><div class="muted">' + esc(e.date) + ' · for ' + esc(e.forMonth) + (e.receipt ? ' · ' + esc(e.receipt) : '') + (e.collectedBy ? ' · by ' + esc(e.collectedBy) : '') + (e.remarks ? ' · ' + esc(e.remarks) : '') + '</div>' +
-        (state.user.role === 'admin' ? '<button class="btn sm sec" data-void="' + i + '" style="color:var(--red);margin-top:4px">Void</button>' : '') + '</div><div class="amt">' + tk(e.deposit) + '</div></div>').join('') + '</div>';
+        (state.user.role === 'admin' ? '<button class="btn sm sec" data-void="' + i + '" style="margin-top:4px" aria-label="More actions">⋯</button>' : '') + '</div><div class="amt">' + tk(e.deposit) + '</div></div>').join('') + '</div>';
       view.querySelectorAll('[data-void]').forEach((b) => b.onclick = () => {
         const e = t[+b.dataset.void];
-        voidFlow(e.receipt ? { tab: 'Receive', receipt: e.receipt } : { tab: 'Receive', row: e.row, mid: e.mid, forMonth: e.forMonth, deposit: e.deposit }, (e.receipt ? 'receipt ' + e.receipt : e.mid + ' ' + e.forMonth) + ' (' + e.name + ')', viewTx);
+        const what = (e.receipt ? 'Receipt ' + e.receipt : e.mid + ' ' + e.forMonth) + ' (' + e.name + ')';
+        rowMenu(what, [{ label: 'Open ledger', run: () => { location.hash = '#/ledger/' + e.mid; } }, { label: 'Void…', danger: true, run: () => voidFlow(e.receipt ? { tab: 'Receive', receipt: e.receipt } : { tab: 'Receive', row: e.row, mid: e.mid, forMonth: e.forMonth, deposit: e.deposit }, what, viewTx) }]);
       });
     } catch (e) { fail(e); }
   }
@@ -556,11 +619,11 @@
         (can('expenses') ? '<h3>New expense</h3><div class="card"><label>Fund</label><div class="tabs"><button class="on" data-fund="Somiti">Somiti</button><button data-fund="Mosjid">🕌 Mosjid</button></div>' +
           '<label>Purpose</label><input id="ep" placeholder="e.g. Bank charge, printing forms"><label>Amount (Tk)</label><input id="ea" type="number" inputmode="numeric"><label>Date</label><input id="ed" type="date" value="' + today() + '"><label>Paid from</label><select id="ef">' + moneyOpts(money) + '</select><label>Remarks (optional)</label><input id="er">' +
           '<button class="btn" id="esave">Save expense</button><div id="eerr" class="err"></div></div>' : '') +
-        '<h3>Recent</h3><div class="card">' + (d.rows.map((e) => '<div class="ent"><div><b>' + esc(e.purpose) + '</b> <span class="chip">' + esc(e.fund) + '</span><div class="muted">' + esc(e.date) + (e.paidFrom ? ' · from ' + esc(e.paidFrom) : '') + (e.voucher ? ' · ' + esc(e.voucher) : '') + (e.remarks ? ' · ' + esc(e.remarks) : '') + '</div>' + (state.user.role === 'admin' && e.fund !== 'Withdrawal' ? '<button class="btn sm sec" data-ev="' + esc(e.row) + '|' + esc(e.amount) + '|' + esc(e.voucher) + '" style="color:var(--red);margin-top:4px">Void</button>' : '') + '</div><div class="amt">' + tk(e.amount) + '</div></div>').join('') || '<div class="muted">No expenses yet</div>') + '</div>';
-      view.querySelectorAll('[data-ev]').forEach((b) => b.onclick = () => { const [row, amount, voucher] = b.dataset.ev.split('|'); voidFlow(voucher ? { tab: 'Expenses', receipt: voucher } : { tab: 'Expenses', row: +row, amount: +amount }, 'expense ' + (voucher || '') + ' (' + tk(amount) + ' Tk)', viewExpenses); });
+        '<h3>Recent</h3><div class="card">' + (d.rows.map((e) => '<div class="ent"><div><b>' + esc(e.purpose) + '</b> <span class="chip">' + esc(e.fund) + '</span><div class="muted">' + esc(e.date) + (e.paidFrom ? ' · from ' + esc(e.paidFrom) : '') + (e.voucher ? ' · ' + esc(e.voucher) : '') + (e.remarks ? ' · ' + esc(e.remarks) : '') + '</div>' + (state.user.role === 'admin' && e.fund !== 'Withdrawal' ? '<button class="btn sm sec" data-ev="' + esc(e.row) + '|' + esc(e.amount) + '|' + esc(e.voucher) + '" style="margin-top:4px" aria-label="More actions">⋯</button>' : '') + '</div><div class="amt">' + tk(e.amount) + '</div></div>').join('') || '<div class="muted">No expenses yet</div>') + '</div>';
+      view.querySelectorAll('[data-ev]').forEach((b) => b.onclick = () => { const [row, amount, voucher] = b.dataset.ev.split('|'); const what = 'Expense ' + (voucher || '') + ' (' + tk(amount) + ' Tk)'; rowMenu(what, [{ label: 'Void…', danger: true, run: () => voidFlow(voucher ? { tab: 'Expenses', receipt: voucher } : { tab: 'Expenses', row: +row, amount: +amount }, what, viewExpenses) }]); });
       view.querySelectorAll('[data-ok],[data-no]').forEach((b) => b.onclick = async () => {
         const ok = !!b.dataset.ok; const id = b.dataset.ok || b.dataset.no;
-        if (!confirm((ok ? 'Approve' : 'Reject') + ' this expense?')) return;
+        if (!await ask((ok ? 'Approve' : 'Reject') + ' this expense?')) return;
         view.querySelectorAll('[data-ok],[data-no]').forEach((x) => { x.disabled = true; });
         try { const r = await api('decide', { id, approve: ok }); toast(ok ? 'Approved ' + r.voucher : 'Rejected'); viewExpenses(); } catch (e) { toast(e.message, 5000); view.querySelectorAll('[data-ok],[data-no]').forEach((x) => { x.disabled = false; }); }
       });
@@ -568,9 +631,9 @@
       view.querySelectorAll('[data-fund]').forEach((b) => b.onclick = () => { fund = b.dataset.fund; view.querySelectorAll('[data-fund]').forEach((x) => x.classList.toggle('on', x === b)); });
       if ($('#esave')) $('#esave').onclick = async () => {
         const amt = Number($('#ea').value || 0);
-        if (!confirm('Save ' + tk(amt) + ' Tk expense from the ' + fund + ' fund?')) return;
+        if (!await ask('Save ' + tk(amt) + ' Tk expense from the ' + fund + ' fund?')) return;
         const sb = $('#esave'); sb.disabled = true; sb.textContent = 'Saving…'; $('#eerr').textContent = '';
-        try { const r = await api('addExpense', { fund, purpose: $('#ep').value, amount: amt, date: $('#ed').value, paidFrom: $('#ef').value, remarks: $('#er').value }); if (r.pending) alert('Saved for approval. This is a big amount, so a different admin or management member must approve it before it counts.'); else toast('Saved ' + r.voucher); viewExpenses(); }
+        try { const r = await api('addExpense', { fund, purpose: $('#ep').value, amount: amt, date: $('#ed').value, paidFrom: $('#ef').value, remarks: $('#er').value }); if (r.pending) await info('Saved for approval. This is a big amount, so a different admin or management member must approve it before it counts.'); else toast('Saved ' + r.voucher); viewExpenses(); }
         catch (e) { $('#eerr').textContent = e.message; sb.disabled = false; sb.textContent = 'Save expense'; }
       };
     } catch (e) { fail(e); }
@@ -587,7 +650,7 @@
         view.innerHTML = '<a href="#/more" class="muted">← More</a><h2>Cash book</h2><div class="card"><b>Set opening balances</b><p class="muted">Enter how much is in each place at the START of the chosen day (count the cash, check the bank statement). From then on the app tracks every taka automatically, and the bank balance is never typed by hand again.</p>' +
           (admin ? '<label>Start date</label><input id="od" type="date" value="' + today() + '">' + c.accounts.map((a) => '<label>' + esc(a) + ' (Tk)</label><input data-open="' + esc(a) + '" type="number" inputmode="numeric" value="0">').join('') + '<button class="btn" id="osave">Save opening balances</button><div id="oerr" class="err"></div>' : '<p>Ask the admin to set opening balances.</p>') + '</div>';
         if ($('#osave')) $('#osave').onclick = async () => {
-          if (!confirm('Save opening balances? This is the starting point for all balances.')) return;
+          if (!await ask('Save opening balances? This is the starting point for all balances.')) return;
           try { for (const i of view.querySelectorAll('[data-open]')) await api('addCash', { type: 'OPENING', to: i.dataset.open, amount: Number(i.value || 0), date: $('#od').value, note: 'Opening balance' }); toast('Saved'); viewCash(); }
           catch (e) { $('#oerr').textContent = e.message; }
         };
@@ -614,7 +677,7 @@
       $('#csave').onclick = async () => {
         try {
           const v = (id) => ($('#' + id) || {}).value;
-          if (t === 'RECON') { const r = await api('reconcile', { account: v('cacc'), statementBalance: v('camt'), date: v('cdate'), note: v('cnote') }); alert(r.account + ': real ' + tk(r.statement) + ', app ' + tk(r.app) + (r.difference ? '\nDifference: ' + tk(r.difference) + ' Tk. Find the missing entry.' : '\n✓ Matches')); }
+          if (t === 'RECON') { const r = await api('reconcile', { account: v('cacc'), statementBalance: v('camt'), date: v('cdate'), note: v('cnote') }); await info(r.account + ': real ' + tk(r.statement) + ', app ' + tk(r.app) + (r.difference ? '\nDifference: ' + tk(r.difference) + ' Tk. Find the missing entry.' : '\n✓ Matches')); }
           else await api('addCash', { type: t, from: v('cfrom'), to: v('cto'), person: v('cperson'), amount: v('camt'), date: v('cdate'), note: v('cnote') });
           toast('Saved'); viewCash();
         } catch (e) { $('#cerr').textContent = e.message; }
@@ -631,7 +694,7 @@
         '<h3>Members due (' + r.list.length + ')</h3><div class="card">' + (r.list.map((x) => '<div class="ent"><div><b>' + esc(x.name) + '</b> <span class="muted">' + esc(x.mid) + '</span><div class="muted">' + (x.sms ? 'SMS' : 'WhatsApp only') + '</div></div><div class="amt"><span class="chip due">' + x.due + ' Due</span>' + (x.wa ? '<div><a target="_blank" rel="noopener" href="' + esc(x.wa) + '">💬</a></div>' : '') + '</div></div>').join('') || '<div class="muted">Nobody is due</div>') + '</div>' +
         (r.list.length ? '<button class="btn" id="send">Send SMS reminders now (' + r.list.filter((x) => x.sms).length + ')</button>' : '');
       if ($('#send')) $('#send').onclick = async () => {
-        if (!confirm('Send due reminder SMS to ' + r.list.filter((x) => x.sms).length + ' members now?')) return;
+        if (!await ask('Send due reminder SMS to ' + r.list.filter((x) => x.sms).length + ' members now?')) return;
         try { const s = await api('reminders', { send: true }); toast('Sent ' + s.list.filter((x) => x.sms).length + ' SMS'); viewReminders(); } catch (e) { toast(e.message); }
       };
     } catch (e) { fail(e); }
@@ -653,14 +716,15 @@
         '<div class="card">' + (list.map((x) => '<div class="ent"><div><b>' + esc(x.name) + '</b> <span class="muted">' + esc(x.mid) + '</span><div class="muted">' + esc(x.months.join(', ')) + '</div>' +
           (can('payments') ? '<button class="btn sm" data-col="' + esc(x.mid) + '" style="margin-top:6px">Collect ' + tk(x.amount) + ' Tk</button>' : '') + '</div><div class="amt" style="color:var(--red)">' + tk(x.amount) + '</div></div>').join('') || '<div class="muted">✅ No service charge due</div>') + '</div>' +
         (hist.length ? '<h3>Collected lately (' + hist.length + ')</h3><div class="card">' + hist.map((x, i) => '<div class="ent"><div><b>' + esc(x.name) + '</b> <span class="muted">' + esc(x.mid) + '</span><div class="muted">' + esc(x.date) + ' · ' + esc(x.receipt) + ' · ' + esc(x.months) + (x.collectedBy ? ' · by ' + esc(x.collectedBy) : '') + '</div>' +
-          (admin ? '<button class="btn sm sec" data-scv="' + i + '" style="color:var(--red);margin-top:6px">Void</button>' : '') + '</div><div class="amt">' + tk(x.amount) + '</div></div>').join('') + '</div>' : '');
+          (admin ? '<button class="btn sm sec" data-scv="' + i + '" style="margin-top:6px" aria-label="More actions">⋯</button>' : '') + '</div><div class="amt">' + tk(x.amount) + '</div></div>').join('') + '</div>' : '');
       view.querySelectorAll('[data-scv]').forEach((b) => b.onclick = () => {
         const x = hist[+b.dataset.scv];
-        voidFlow({ tab: 'SC', receipt: x.receipt }, 'service charge collection ' + x.receipt + ' (' + tk(x.amount) + ' Tk, ' + x.name + ').\nThose months will show as service charge due again', () => viewScDue(args));
+        const what = 'Service charge ' + x.receipt + ' (' + tk(x.amount) + ' Tk, ' + x.name + ')';
+        rowMenu(what, [{ label: 'Void…', danger: true, run: () => voidFlow({ tab: 'SC', receipt: x.receipt }, what + '\nThose months will show as service charge due again.', () => viewScDue(args)) }]);
       });
       view.querySelectorAll('[data-col]').forEach((b) => b.onclick = async () => {
         const x = list.find((y) => y.mid === b.dataset.col);
-        if (!confirm('Collect ' + tk(x.amount) + ' Tk service charge from ' + x.mid + ' (' + x.name + ') for ' + x.months.length + ' month(s)?')) return;
+        if (!await ask('Collect ' + tk(x.amount) + ' Tk service charge from ' + x.mid + ' (' + x.name + ') for ' + x.months.length + ' month(s)?')) return;
         b.disabled = true; b.textContent = 'Saving…';
         try {
           const r = await api('collectSc', { mid: x.mid, account: $('#sacct').value, collectedBy: $('#scb').value, date: $('#sdate').value });
@@ -730,7 +794,7 @@
           p.otherAccounts.length ? '<div class="card" style="background:var(--redbg)">⚠️ This member is Account Holder for ' + esc(p.otherAccounts.join(', ')) + '. Move those accounts to another holder first (More › Users › Link / transfer).</div>' :
           '<div class="card"><label>Paid to</label><input id="pto" value="' + esc(p.name) + '"><div class="muted">' + (p.nominee ? 'Nominee: ' + esc(p.nominee) : 'No nominee recorded') + '</div><label>Paid from</label><select id="pfrom">' + moneyOpts(money) + '</select><label>Date</label><input id="pdate" type="date" value="' + today() + '"><label>Reason</label><input id="prs" placeholder="e.g. Member left / passed away (paid to nominee)"><button class="btn" id="pgo" style="background:var(--red)">Close account & record payout</button><div id="perr" class="err"></div></div>');
       if ($('#pgo')) $('#pgo').onclick = async () => {
-        if (!confirm('Close ' + p.mid + ' and pay back ' + tk(p.deposits) + ' Tk to ' + $('#pto').value + '?\nTheir login will be switched off. This cannot be undone from the app.')) return;
+        if (!await ask('Close ' + p.mid + ' and pay back ' + tk(p.deposits) + ' Tk to ' + $('#pto').value + '?\nTheir login will be switched off. This cannot be undone from the app.')) return;
         try {
           const r = await api('closeAccount', { mid, paidTo: $('#pto').value, paidFrom: $('#pfrom').value, date: $('#pdate').value, reason: $('#prs').value, confirmAmount: p.deposits }); state.accounts = null;
           view.innerHTML = '<div class="card"><h2>✅ Account closed</h2><div class="kv"><span class="l">Paid</span><span class="v">' + tk(r.paid) + ' Tk</span></div><div class="kv"><span class="l">Voucher</span><span class="v">' + esc(r.voucher) + '</span></div><div class="kv"><span class="l">Paid to</span><span class="v">' + esc(r.paidTo) + '</span></div><a class="btn" href="#/accounts">Back to accounts</a></div>';
@@ -775,27 +839,28 @@
           '</div></div>').join('');
         $('#ul').querySelectorAll('[data-reset]').forEach((b) => b.onclick = async () => {
           const id = b.dataset.reset;
-          if (!confirm('Make a new PIN for ' + id + ' and send it by SMS?')) return;
+          if (!await ask('Make a new PIN for ' + id + ' and send it by SMS?\nTheir old PIN stops working.', 'Make new PIN')) return;
           try {
             const r = await api('resetPin', { userId: id, sendSms: true });
-            alert('New PIN for ' + id + ': ' + r.pin + '\nSMS: ' + (r.waOnly ? 'not possible (foreign number)' : (r.sms || 'not sent')));
-            if (r.wa && (r.waOnly || confirm('Also send the PIN on WhatsApp?'))) window.open(r.wa, '_blank');
+            await showPin(id, r.pin, 'SMS: ' + (r.waOnly ? 'not possible (foreign number)' : (r.sms || 'not sent')));
+            if (r.wa && (r.waOnly || await ask('Also send the PIN on WhatsApp?', 'Open WhatsApp'))) window.open(r.wa, '_blank');
             viewUsers();
           } catch (e) { toast(e.message); }
         });
         $('#ul').querySelectorAll('[data-link]').forEach((b) => b.onclick = async () => {
           const mid = b.dataset.link;
-          const to = (prompt('Put account ' + mid + ' under which Account Holder ID?\n(Enter ' + mid + ' itself to undo a link)') || '').trim().toUpperCase();
-          if (!to) return;
-          const reason = (prompt('Reason (required), e.g. "Child account of ' + to + '"') || '').trim();
-          if (!reason) { toast('Reason is required'); return; }
+          const holders = users.filter((x) => x.status === 'active' && /^ATFS-/.test(x.id) && x.id !== mid).map((x) => [x.id, x.id + ' · ' + x.name]);
+          const f = await sheet({ title: 'Link / transfer ' + mid, text: 'Choose the Account Holder who will see this account in their login.',
+            fields: [{ id: 'to', label: 'Account Holder', options: [[mid, mid + ' · itself (undo a link)']].concat(holders), value: holders.length ? holders[0][0] : mid }, { id: 'reason', label: 'Reason', required: true, placeholder: 'e.g. Child account' }], ok: 'Move account' });
+          if (!f) return;
+          const to = f.to, reason = f.reason;
           try { const r = await api('setHolder', { mid, holderUserId: to, reason }); toast('Moved ' + r.moved.join(', ') + ' to ' + r.to); viewUsers(); } catch (e) { toast(e.message, 5000); }
         });
         $('#ul').querySelectorAll('[data-phone]').forEach((b) => b.onclick = async () => {
           const id = b.dataset.phone; const cur = (users.find((x) => x.id === id) || {}).phone || '';
-          const ph = prompt('Mobile number for ' + id + ' (01XXXXXXXXX, or with country code):', cur);
-          if (ph === null) return;
-          try { await api('setUserPhone', { userId: id, phone: ph.trim() }); toast('Saved'); viewUsers(); } catch (e) { toast(e.message); }
+          const f = await sheet({ title: 'Mobile number for ' + id, fields: [{ id: 'ph', label: 'Mobile (01XXXXXXXXX, or with country code)', type: 'tel', inputmode: 'tel', value: cur }], ok: 'Save' });
+          if (!f) return;
+          try { await api('setUserPhone', { userId: id, phone: f.ph }); toast('Saved'); viewUsers(); } catch (e) { toast(e.message); }
         });
         $('#ul').querySelectorAll('[data-perm]').forEach((c) => c.onchange = async () => {
           const id = c.dataset.u;
@@ -807,7 +872,7 @@
       $('#nadd').onclick = async () => {
         try {
           const r = await api('addStaff', { userId: $('#nid').value.trim().toUpperCase(), name: $('#nname').value.trim(), phone: $('#nphone').value.trim(), role: $('#nrole').value });
-          alert('User added. First PIN: ' + r.pin + '\nGive it to them privately.'); viewUsers();
+          await showPin($('#nid').value.trim().toUpperCase(), r.pin, 'Give it to them privately.'); viewUsers();
         } catch (e) { $('#nerr').textContent = e.message; }
       };
     } catch (e) { fail(e); }

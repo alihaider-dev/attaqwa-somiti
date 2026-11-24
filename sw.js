@@ -1,5 +1,5 @@
 // Caches the app screens only. Data always comes live from the sheet.
-const CACHE = 'ats-v6';
+const CACHE = 'ats-v7';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'config.js', 'manifest.json', 'icon-192.png', 'icon-512.png'];
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL))); self.skipWaiting(); });
 self.addEventListener('activate', (e) => {

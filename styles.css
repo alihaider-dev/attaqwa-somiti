@@ -28,12 +28,17 @@ h3{font-size:14px;margin:18px 0 8px;color:var(--mut);text-transform:uppercase;le
 .chip.adv{background:var(--grnbg);color:var(--grn)}
 .chip.ok{background:var(--grnbg);color:var(--grn)}
 label{display:block;font-size:13px;color:var(--mut);margin:12px 0 4px}
-input,select,textarea{width:100%;font:inherit;padding:12px;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink)}
+input,select,textarea{width:100%;font:inherit;font-size:16px;padding:12px;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink)}
 input:focus,select:focus,textarea:focus{outline:2px solid var(--g);border-color:transparent}
 .btn{display:block;width:100%;margin-top:16px;padding:14px;border:0;border-radius:12px;background:var(--g);color:#fff;font:inherit;font-weight:700;cursor:pointer}
 .btn.sec{background:var(--g2);color:var(--g)}
-.btn.sm{display:inline-block;width:auto;margin:0;padding:8px 12px;font-size:13px}
+.btn.sm{display:inline-flex;align-items:center;justify-content:center;width:auto;min-width:44px;min-height:44px;margin:0;padding:8px 14px;font-size:14px;text-decoration:none}
 .btn:disabled{opacity:.5}
+.btn:active,.stepper button:active,.tabs button:active{transform:scale(.98);filter:brightness(.94)}
+.btn.danger{background:var(--red);color:#fff}
+a.btn{text-align:center;text-decoration:none}
+:focus-visible{outline:3px solid #1a73e8;outline-offset:2px}
+button,a,select,input{touch-action:manipulation}
 .row{display:flex;gap:8px;align-items:center}
 .stepper{display:flex;align-items:center;gap:8px}
 .stepper button{width:44px;height:44px;border-radius:10px;border:1px solid var(--line);background:#fff;font-size:20px}
@@ -54,6 +59,23 @@ input:focus,select:focus,textarea:focus{outline:2px solid var(--g);border-color:
 .nav a{flex:1;text-align:center;padding:10px 4px 9px;font-size:11px;color:var(--mut);text-decoration:none}
 .nav a .i{display:block;font-size:20px;line-height:1.1}
 .nav a.on{color:var(--g);font-weight:700}
-.toast{position:fixed;left:16px;right:16px;bottom:84px;background:#1d2421;color:#fff;padding:12px 14px;border-radius:12px;z-index:9;text-align:center}
+.toast{position:fixed;left:16px;right:16px;top:calc(70px + env(safe-area-inset-top));box-shadow:0 6px 20px rgba(0,0,0,.25);background:#1d2421;color:#fff;padding:12px 14px;border-radius:12px;z-index:9;text-align:center}
 .muted{color:var(--mut);font-size:13px}
 .total{font-size:22px;font-weight:800;color:var(--g)}
+
+/* in-app bottom sheet (replaces browser pop-ups) */
+.ov{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.45);display:flex;align-items:flex-end;justify-content:center}
+.sheet{background:#fff;width:100%;max-width:720px;max-height:88vh;overflow:auto;overscroll-behavior:contain;border-radius:18px 18px 0 0;padding:18px 16px calc(16px + env(safe-area-inset-bottom))}
+.sheet h2{margin:0 0 8px}
+.shtext{color:var(--ink);margin-bottom:6px;overflow-wrap:anywhere}
+.pin{font-size:34px;font-weight:800;letter-spacing:.18em;text-align:center;color:var(--g);background:var(--g2);border-radius:12px;padding:14px;margin:8px 0;font-variant-numeric:tabular-nums}
+/* payment screen: total and main button always in reach */
+.paybar{position:fixed;left:0;right:0;bottom:calc(58px + env(safe-area-inset-bottom));z-index:4;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;background:#fff;border-top:1px solid var(--line);box-shadow:0 -4px 14px rgba(0,0,0,.06)}
+.paybar .pb-l{min-width:0}
+.paybar .muted{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.paybar .btn{width:auto;min-width:120px;margin:0}
+label.check{display:flex;gap:10px;align-items:center;min-height:44px;margin:10px 0 0;color:var(--ink);font-size:15px}
+label.check input{width:22px;height:22px;flex:none;padding:0}
+details.more{margin-top:12px}
+details.more summary{color:var(--g);font-weight:600;min-height:44px;display:flex;align-items:center;cursor:pointer}
+.total,.amt,.stat .v,.kv .v{font-variant-numeric:tabular-nums}
