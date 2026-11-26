@@ -999,7 +999,7 @@
             const pv = await apiLive('setHolder', { mid, holderUserId: to, dryRun: true });
             const others = pv.moved.filter((x) => x !== mid);
             const lines = [pv.undo ? mid + ' becomes its own account again.' : mid + ' will move under ' + pv.to + ' · ' + pv.toName + '.'];
-            if (others.length) lines.push((pv.undo ? 'These come back with it: ' : 'Its ' + others.length + ' account' + (others.length > 1 ? 's' : '') + ' move too: ') + others.join(', ') + '.');
+            if (others.length) lines.push((pv.undo ? 'These come back with it: ' : 'Its ' + others.length + ' account' + (others.length > 1 ? 's move too: ' : ' moves too: ')) + others.join(', ') + '.');
             if (pv.loginOff) lines.push(mid + "'s own login will switch OFF. " + pv.to + ' will see ' + (others.length ? 'all of these' : 'it') + ' in their app.');
             if (pv.loginOn) lines.push(mid + "'s own login will switch back ON (same PIN as before).");
             lines.push('No money moves. You can undo this later from the same button.');
