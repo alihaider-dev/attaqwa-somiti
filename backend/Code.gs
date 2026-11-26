@@ -1450,8 +1450,10 @@ function closeAccount_(u, b) {
 function applyDashboardV2() {
   const ss = ss_(); const d = ss.getSheetByName(CFG.TABS.DASH);
   const t = infoSheet_();
-  if (colOf_(t.head, 'Status') < 0) t.sheet.getRange(t.headerRow, t.head.filter(h => h).length + 1).setValue('Status').setFontWeight('bold');
+  if (colOf_(t.head, 'Status') < 0) { t.sheet.getRange(t.headerRow, t.head.filter(h => h).length + 1).setValue('Status').setFontWeight('bold'); SpreadsheetApp.flush(); }
+  bust_(); // read the header again: the saved copy does not have the new column yet
   const t2 = infoSheet_(); const sc = colOf_(t2.head, 'Status') + 1;
+  if (sc < 1) throw new Error('Status column not found in INFORMATION. Nothing changed.');
   const colL = c => { let s = ''; while (c > 0) { const m = (c - 1) % 26; s = String.fromCharCode(65 + m) + s; c = Math.floor((c - 1) / 26); } return s; };
   const S = colL(sc);
   const first = t2.firstDataRow;
