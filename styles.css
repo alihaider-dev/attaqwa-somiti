@@ -122,3 +122,8 @@ div[data-mid]:focus-visible{outline-offset:-2px}
 
 /* no pinch zoom / double-tap zoom: the app should feel like a native app (scrolling still works) */
 html,body{touch-action:pan-x pan-y;-webkit-text-size-adjust:100%}
+
+/* account ledger month switcher */
+.mnav{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:4px 0 12px}
+.btn.sm.off{opacity:.3}
+.mnav .btn.sm{font-size:20px}

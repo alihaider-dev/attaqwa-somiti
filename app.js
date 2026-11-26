@@ -18,7 +18,7 @@
 
   /* ---------- API ---------- */
   // Speed: read-only screens show the last saved copy instantly, then refresh in the background.
-  const CACHEABLE = ['payInit', 'scDue', 'scHistory', 'dashboard', 'accounts', 'ledger', 'transactions', 'expenses', 'cashbook', 'profile', 'moneyAccounts', 'users', 'collectorNames', 'pending', 'monthReport'];
+  const CACHEABLE = ['acctLedger', 'payInit', 'scDue', 'scHistory', 'dashboard', 'accounts', 'ledger', 'transactions', 'expenses', 'cashbook', 'profile', 'moneyAccounts', 'users', 'collectorNames', 'pending', 'monthReport'];
   const fresh = {};
   // True once the user has typed or picked something on the current screen: then a background refresh must not redraw it.
   let dirty = false;
@@ -233,7 +233,7 @@
     login: viewLogin, dashboard: viewDashboard, accounts: viewAccounts, ledger: viewLedger,
     pay: viewPay, tx: viewTx, more: viewMore, users: viewUsers,
     member: viewMemberForm, profile: viewProfile, expenses: viewExpenses, cash: viewCash, reminders: viewReminders, backups: viewBackups,
-    report: viewReport, health: viewHealth, close: viewClose, scdue: viewScDue, setpin: viewSetPin
+    report: viewReport, health: viewHealth, close: viewClose, scdue: viewScDue, setpin: viewSetPin, acct: viewAcct
   };
   function go(keepScroll) {
     const parts = (location.hash || '').replace(/^#\//, '').split('/');
@@ -766,13 +766,18 @@
       }
       const ck = c.check;
       view.innerHTML = '<a href="#/more" class="muted">← More</a><h2>Cash book</h2><div class="muted">Tracking since ' + esc(c.start) + '</div>' +
-        '<div class="grid" style="margin-top:10px">' + Object.keys(c.balances).map((a) => '<div class="stat"><div class="l">' + esc(a) + '</div><div class="v">' + tk(c.balances[a]) + ' Tk</div>' + (c.lastRecon[a] ? '<div class="muted">Checked ' + esc(c.lastRecon[a].date) + (c.lastRecon[a].diff ? ' · <span style="color:var(--red)">diff ' + tk(c.lastRecon[a].diff) + '</span>' : ' · ✓') + '</div>' : '') + '</div>').join('') +
+        '<div class="grid" style="margin-top:10px">' + Object.keys(c.balances).map((a) => '<a class="stat tile" href="#/acct/' + encodeURIComponent(a) + '"><div class="l">' + esc(a) + '</div><div class="v">' + tk(c.balances[a]) + ' Tk</div>' + (c.lastRecon[a] ? '<div class="muted">Checked ' + esc(c.lastRecon[a].date) + (c.lastRecon[a].diff ? ' · <span style="color:var(--red)">diff ' + tk(c.lastRecon[a].diff) + '</span>' : ' · ✓') + '</div>' : '') + '<div class="s">View ledger ›</div></a>').join('') +
         '<div class="stat"><div class="l">Total</div><div class="v">' + tk(c.total) + ' Tk</div></div></div>' +
         '<div class="card" style="margin-top:12px;background:' + (ck.ok ? 'var(--grnbg)' : 'var(--redbg)') + '">' + (ck.ok ? '✅ Matches the Dashboard total' + (c.sinceStart.profit || c.sinceStart.charges ? ' (+ bank profit − charges)' : '') : '⚠️ Does not match the Dashboard: app ' + tk(c.total) + ' vs expected ' + tk(ck.expected) + '. Check opening balances or missing entries.') + '</div>' +
         (c.collectors && c.collectors.length ? '<h3>Cash held by collectors</h3><div class="card">' + c.collectors.map((x) => '<div class="kv"><span class="l">' + esc(x.name) + '</span><span class="v">' + tk(x.holding) + ' Tk</span></div>').join('') + '<div class="muted">Cash they received (into Cash) minus what they handed over.</div></div>' : '') +
         (admin ? '<h3>New entry</h3><div class="card"><div class="tabs" style="flex-wrap:wrap"><button data-t="HANDOVER">Handover</button><button class="on" data-t="TRANSFER">Transfer</button><button data-t="BANK_PROFIT">Bank profit</button><button data-t="BANK_CHARGE">Bank charge</button><button data-t="RECON">Check balance</button></div><div id="cf"></div><button class="btn" id="csave">Save</button><div id="cerr" class="err"></div></div>' : '') +
-        '<h3>Entries</h3><div class="card">' + (c.entries.map((e) => '<div class="ent"><div><b>' + esc(e.type.replace('_', ' ').toLowerCase()) + '</b><div class="muted">' + esc(e.date) + ' · ' + esc([e.from, e.to].filter(Boolean).join(' → ')) + (e.note ? ' · ' + esc(e.note) : '') + '</div></div><div class="amt">' + tk(e.amount) + '</div></div>').join('') || '<div class="muted">None</div>') + '</div>';
+        '<h3>Entries</h3><div class="card">' + (c.entries.map((e, i) => '<div class="ent"><div><b>' + esc(e.type.replace('_', ' ').toLowerCase()) + '</b><div class="muted">' + esc(e.date) + ' · ' + esc([e.from, e.to].filter(Boolean).join(' → ')) + (e.note ? ' · ' + esc(e.note.replace('|', ' · ')) : '') + '</div>' + (admin ? '<button class="btn sm sec" data-cv="' + i + '" style="margin-top:4px" aria-label="More actions">⋯</button>' : '') + '</div><div class="amt">' + tk(e.amount) + '</div></div>').join('') || '<div class="muted">None</div>') + '</div>';
       if (!admin) return;
+      view.querySelectorAll('[data-cv]').forEach((b) => b.onclick = () => {
+        const e = c.entries[+b.dataset.cv];
+        const what = e.type.replace('_', ' ').toLowerCase().replace(/^./, (x) => x.toUpperCase()) + ' ' + tk(e.amount) + ' Tk' + (e.from || e.to ? ' (' + [e.from, e.to].filter(Boolean).join(' → ') + ')' : '') + ', ' + e.date;
+        rowMenu(what, [{ label: 'Void…', danger: true, run: () => voidFlow({ tab: 'Cash', row: e.row, ref: e.ref, type: e.type, amount: e.amount }, what + (e.type === 'OPENING' ? '\nThis is an opening balance: every balance after it will change.' : '\nThe balances go back to what they were before this entry.'), viewCash) }]);
+      });
       let t = 'TRANSFER';
       const form = () => {
         const sel = (id, l) => '<label>' + l + '</label><select id="' + id + '">' + accOpts + '</select>';
@@ -790,6 +795,28 @@
           toast('Saved'); viewCash();
         } catch (e) { $('#cerr').textContent = e.message; }
       };
+    } catch (e) { fail(e); }
+  }
+
+  /* Ledger of one money account (Cash / Bank / bKash): every in and out for a month, with a running balance. */
+  async function viewAcct(args) {
+    if (!isStaff()) { location.hash = '#/more'; return; }
+    const acct = decodeURIComponent(args[0] || ''); const month = args[1] || '';
+    busy();
+    try {
+      const L = await api('acctLedger', { account: acct, month });
+      if (!L.started) { view.innerHTML = '<a href="#/cash" class="muted">← Cash book</a><h2>Account ledger</h2><div class="card">Set opening balances in the Cash book first.</div>'; return; }
+      const i = L.months.indexOf(L.month); const prev = i > 0 ? L.months[i - 1] : '', next = i >= 0 && i < L.months.length - 1 ? L.months[i + 1] : '';
+      const link = (a, m) => '#/acct/' + encodeURIComponent(a) + (m ? '/' + m : '');
+      view.innerHTML = '<a href="#/cash" class="muted">← Cash book</a><h2>' + esc(L.account) + ' ledger</h2>' +
+        '<div class="tabs">' + L.accounts.map((a) => '<button type="button" class="' + (a === L.account ? 'on' : '') + '" data-acc="' + esc(a) + '">' + esc(a) + '</button>').join('') + '</div>' +
+        '<div class="mnav">' + (prev ? '<a class="btn sm sec" href="' + link(L.account, prev) + '" aria-label="Previous month">‹</a>' : '<span class="btn sm sec off" aria-hidden="true">‹</span>') +
+        '<b>' + esc(L.label) + '</b>' + (next ? '<a class="btn sm sec" href="' + link(L.account, next) + '" aria-label="Next month">›</a>' : '<span class="btn sm sec off" aria-hidden="true">›</span>') + '</div>' +
+        '<div class="card">' + kvRow('Opening balance', tk(L.opening) + ' Tk') + kvRow('Money in', '<span style="color:var(--grn)">+ ' + tk(L.totalIn) + ' Tk</span>', true) + kvRow('Money out', '<span style="color:var(--red)">− ' + tk(L.totalOut) + ' Tk</span>', true) + kvRow('Closing balance', '<span class="total">' + tk(L.closing) + ' Tk</span>', true) + '</div>' +
+        '<h3>Entries (' + L.rows.length + ')</h3><div class="card">' + (L.rows.map((r) => '<div class="ent"><div><b>' + esc(r.text) + '</b><div class="muted">' + esc(r.date) + (r.ref ? ' · ' + esc(r.ref) : '') + '</div></div>' +
+          '<div class="amt" style="color:' + (r.amt < 0 ? 'var(--red)' : 'var(--grn)') + '">' + (r.amt < 0 ? '− ' : '+ ') + tk(Math.abs(r.amt)) + '<div class="muted">bal ' + tk(r.bal) + '</div></div></div>').join('') || '<div class="muted">Nothing moved in or out this month.</div>') + '</div>' +
+        '<p class="muted">Newest entries are at the bottom. To fix a wrong transfer, void it in the Cash book.</p>';
+      view.querySelectorAll('[data-acc]').forEach((b) => b.onclick = () => { location.hash = link(b.dataset.acc, L.month); });
     } catch (e) { fail(e); }
   }
 

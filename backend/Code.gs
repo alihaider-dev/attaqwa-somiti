@@ -305,6 +305,7 @@ function doPost(e) {
         expenses: () => { if (!isStaff_(u)) throw new Error('Not allowed'); return listExpenses_(b.limit || 100); },
         addExpense: () => addExpense_(u, b),
         cashbook: () => { if (!isStaff_(u)) throw new Error('Not allowed'); return cashbook_(); },
+        acctLedger: () => { if (!isStaff_(u)) throw new Error('Not allowed'); return acctLedger_(b.account, b.month); },
         addCash: () => { requireAdmin_(u); return addCash_(u, b); },
         reconcile: () => { requireAdmin_(u); return reconcile_(u, b); },
         reminders: () => { requireAdmin_(u); return reminders_(u, !!b.send); },
@@ -976,7 +977,7 @@ function cashbook_() {
     check: { dashboardTotal: dashTotal, expected, ok: expected === null ? null : Math.round(expected) === Math.round(total) },
     lastRecon,
     collectors: Object.keys(held).filter(k => Math.round(held[k]) !== 0).map(k => ({ name: label[k], holding: held[k] })).sort((a, b) => b.holding - a.holding),
-    entries: cash.sort((a, b) => b.d - a.d).slice(0, 50).map(r => ({ date: fmtDate_(r.d), type: r.Type, from: r.From, to: r.To, amount: num_(r.Amount), note: r.Note, by: r['Entered By'] }))
+    entries: cash.sort((a, b) => b.d - a.d).slice(0, 50).map(r => ({ row: r._row, ref: String(r.Ref || ''), date: fmtDate_(r.d), type: r.Type, from: r.From, to: r.To, amount: num_(r.Amount), note: r.Note, by: r['Entered By'] }))
   };
 }
 
@@ -1016,6 +1017,87 @@ function reconcile_(u, b) {
   audit_(u, 'reconcile', { acct, stmt, appBal, diff });
   markDirty_();
   return { account: acct, statement: stmt, app: appBal, difference: diff };
+}
+
+/** Admin: void one cash book entry (transfer, handover, bank profit/charge, opening). A copy is kept in App_Voided. */
+function voidCashEntry_(u, b, reason) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error('Another save is running. Try again in a moment.');
+  let out;
+  try {
+    bust_();
+    const s = sh_(CFG.TABS.CASH); const rn = Number(b.row);
+    const r = rn >= 2 && rn <= s.getLastRow() ? s.getRange(rn, 1, 1, CASH_COLS.length).getValues()[0] : null;
+    // The row must still be the SAME entry (rows move when one above is voided).
+    if (!r || String(r[1]) !== String(b.type || '') || num_(r[4]) !== num_(b.amount) || String(r[6] || '') !== String(b.ref || '')) throw new Error('Entry changed since you opened it. Refresh and try again.');
+    if (r[1] === 'OPENING') {
+      const all = s.getRange(2, 1, s.getLastRow() - 1, 2).getValues();
+      if (all.filter(x => x[1] === 'OPENING').length <= 1) throw new Error('This is the only opening balance. Add the correct one first, then void this.');
+    }
+    const vs = sh_(CFG.TABS.VOID);
+    vs.getRange(vs.getLastRow() + 1, 1, 1, VOID_COLS.length).setValues([[new Date(), u.UserID, reason, CFG.TABS.CASH, String(r[6] || ''), '', num_(r[4]), JSON.stringify(r)]]);
+    s.deleteRow(rn);
+    SpreadsheetApp.flush();
+    out = { voided: 1, total: num_(r[4]), tab: CFG.TABS.CASH, receipt: String(r[6] || ''), type: r[1] };
+    audit_(u, 'void', Object.assign({ reason }, out));
+    markDirty_();
+  } finally { lock.releaseLock(); }
+  alert_('VOID by ' + u.UserID + ': cash book ' + String(out.type).toLowerCase() + ' ' + out.total.toLocaleString('en-US') + ' Tk. Reason: ' + reason);
+  return out;
+}
+
+/* ---------------- account ledger: every in and out of one money account, with running balance ---------------- */
+/** All money movements since the cash book start, using the SAME rules as cashbook_() (a test checks the totals agree). */
+function cashMoves_() {
+  const accts = moneyAccounts_();
+  const cash = rowsAsObjects_(CFG.TABS.CASH, CASH_COLS).map(r => Object.assign(r, { d: toDate_(r.Date) }));
+  const openings = cash.filter(r => r.Type === 'OPENING' && r.d);
+  if (!openings.length) return { started: false, accts, moves: [] };
+  const start = new Date(Math.min.apply(null, openings.map(r => r.d.getTime())));
+  const moves = []; let seq = 0;
+  const mv = (d, acct, amt, text, kind, ref, ord) => { if (amt) moves.push({ d: d || start, acct, amt, text, kind, ref: ref || '', ord: ord, seq: seq++ }); };
+  cash.forEach(r => {
+    const amt = num_(r.Amount); const note = String(r.Note || ''); const ref = String(r.Ref || '');
+    if (r.Type === 'OPENING') mv(r.d, r.To, amt, 'Opening balance', 'opening', ref, 0);
+    else if (r.Type === 'TRANSFER') { mv(r.d, r.From, -amt, 'Transfer to ' + r.To + (note ? ' · ' + note : ''), 'transfer', ref, 2); mv(r.d, r.To, amt, 'Transfer from ' + r.From + (note ? ' · ' + note : ''), 'transfer', ref, 2); }
+    else if (r.Type === 'BANK_PROFIT') mv(r.d, r.To, amt, 'Bank profit' + (note ? ' · ' + note : ''), 'profit', ref, 2);
+    else if (r.Type === 'BANK_CHARGE') mv(r.d, r.From, -amt, 'Bank charge' + (note ? ' · ' + note : ''), 'charge', ref, 2);
+    else if (r.Type === 'HANDOVER' && r.To && r.To !== accts[0]) { const who = note.split('|')[0].trim(); mv(r.d, accts[0], -amt, 'Handed into ' + r.To + ' by ' + who, 'handover', ref, 2); mv(r.d, r.To, amt, 'Cash handed in by ' + who, 'handover', ref, 2); }
+  });
+  // receipts: one line per receipt (not per month)
+  const grp = {}; const order = [];
+  receiveRows_().forEach(r => {
+    if (!r.date || r.date < start) return;
+    const v = r.deposit + (r.scLater ? 0 : r.sc); const a = r.account || accts[0];
+    const k = r.receipt ? r.receipt + '|' + a + '|' + r.date.getTime() : 'row' + r.row;
+    if (!grp[k]) { grp[k] = { d: r.date, a, v: 0, n: 0, mid: r.mid, name: r.name, receipt: r.receipt, donors: [] }; order.push(k); }
+    grp[k].v += v; grp[k].n++; if (r.mid === CFG.MOSJID_ID && r.remarks) grp[k].donors.push(r.remarks);
+  });
+  order.forEach(k => { const g = grp[k];
+    const text = g.mid === CFG.MOSJID_ID ? 'Mosjid Fund donation' + (g.donors.length ? ' · ' + g.donors.slice(0, 3).join(', ') + (g.donors.length > 3 ? ' +' + (g.donors.length - 3) : '') : '') : g.mid + ' ' + g.name + ' · ' + g.n + ' month' + (g.n > 1 ? 's' : '');
+    mv(g.d, g.a, g.v, text, 'receipt', g.receipt, 1); });
+  rowsAsObjects_(CFG.TABS.SCC, SCC_COLS).forEach(r => { const d = toDate_(r.Date); if (!d || d < start) return; mv(d, r.Account || accts[0], num_(r.Amount), r.MID + ' ' + r.Name + ' · late service charge', 'sc', String(r.Receipt || ''), 1); });
+  expenseRows_().forEach(r => { if (r.date && r.date >= start) mv(r.date, r.paidFrom || accts[0], -r.amount, (r.fund === 'Withdrawal' ? '' : r.fund + ' expense · ') + r.purpose, 'expense', r.voucher, 3); });
+  moves.sort((a, b) => (a.d - b.d) || (a.ord - b.ord) || (a.seq - b.seq));
+  return { started: true, accts, start, moves };
+}
+function acctLedger_(account, ym) {
+  const cm = cashMoves_();
+  if (!cm.started) return { started: false, accounts: cm.accts };
+  const acct = checkAccount_(account);
+  const now = new Date(); const m = String(ym || '').match(/^(\d{4})-(\d{2})$/);
+  const y = m ? +m[1] : now.getFullYear(), mo = m ? +m[2] - 1 : now.getMonth();
+  const from = new Date(y, mo, 1), to = new Date(y, mo + 1, 1);
+  let bal = 0, opening = 0, tin = 0, tout = 0; const rows = [];
+  cm.moves.forEach(x => {
+    if (x.acct !== acct || x.d >= to) return;
+    if (x.d < from) { bal += x.amt; opening = bal; return; }
+    bal += x.amt; if (x.amt > 0) tin += x.amt; else tout -= x.amt;
+    rows.push({ date: fmtDate_(x.d), text: x.text, kind: x.kind, ref: x.ref, amt: x.amt, bal });
+  });
+  const months = []; let k = monthKey_(cm.start); const endK = Math.max(monthKey_(now), k);
+  for (; k <= endK; k++) months.push(Math.floor(k / 12) + '-' + ('0' + (k % 12 + 1)).slice(-2));
+  return { started: true, account: acct, accounts: cm.accts, month: y + '-' + ('0' + (mo + 1)).slice(-2), label: Utilities.formatDate(from, tz_(), 'MMMM yyyy'), months, opening, totalIn: tin, totalOut: tout, closing: bal, rows };
 }
 
 /* ---------------- due reminders ---------------- */
@@ -1187,6 +1269,7 @@ function sweepSms_() {
 function voidEntry_(u, b) {
   const reason = String(b.reason || '').trim(); if (!reason) throw new Error('Reason is required');
   if (b.tab === 'SC') return voidScCollection_(u, String(b.receipt || '').trim(), reason);
+  if (b.tab === 'Cash') return voidCashEntry_(u, b, reason);
   const tab = b.tab === 'Expenses' ? CFG.TABS.EXP : CFG.TABS.RECEIVE;
   const width = tab === CFG.TABS.EXP ? 9 : 14;
   const lock = LockService.getScriptLock();
