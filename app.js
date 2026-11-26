@@ -994,7 +994,18 @@
             fields: [{ id: 'to', label: 'Account Holder', options: [[mid, mid + ' · itself (undo a link)']].concat(holders), value: holders.length ? holders[0][0] : mid }, { id: 'reason', label: 'Reason', required: true, placeholder: 'e.g. Child account' }], ok: 'Move account' });
           if (!f) return;
           const to = f.to, reason = f.reason;
-          try { const r = await api('setHolder', { mid, holderUserId: to, reason }); toast('Moved ' + r.moved.join(', ') + ' to ' + r.to); viewUsers(); } catch (e) { toast(e.message, 5000); }
+          try {
+            // Ask the server exactly what this will do, show it, and only then save.
+            const pv = await apiLive('setHolder', { mid, holderUserId: to, dryRun: true });
+            const others = pv.moved.filter((x) => x !== mid);
+            const lines = [pv.undo ? mid + ' becomes its own account again.' : mid + ' will move under ' + pv.to + ' · ' + pv.toName + '.'];
+            if (others.length) lines.push((pv.undo ? 'These come back with it: ' : 'Its ' + others.length + ' account' + (others.length > 1 ? 's' : '') + ' move too: ') + others.join(', ') + '.');
+            if (pv.loginOff) lines.push(mid + "'s own login will switch OFF. " + pv.to + ' will see ' + (others.length ? 'all of these' : 'it') + ' in their app.');
+            if (pv.loginOn) lines.push(mid + "'s own login will switch back ON (same PIN as before).");
+            lines.push('No money moves. You can undo this later from the same button.');
+            if (!await sheet({ title: pv.undo ? 'Undo this link?' : 'Move ' + pv.moved.length + ' account' + (pv.moved.length > 1 ? 's' : '') + '?', text: lines.join('\n\n'), ok: pv.undo ? 'Undo link' : 'Move', danger: pv.loginOff })) return;
+            const r = await api('setHolder', { mid, holderUserId: to, reason }); toast('Moved ' + r.moved.join(', ') + ' to ' + r.to, 5000); viewUsers();
+          } catch (e) { toast(e.message, 6000); }
         });
         $('#ul').querySelectorAll('[data-phone]').forEach((b) => b.onclick = async () => {
           const id = b.dataset.phone; const cur = (users.find((x) => x.id === id) || {}).phone || '';

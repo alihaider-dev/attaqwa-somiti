@@ -28,7 +28,7 @@ const CFG = {
 };
 
 const USER_COLS = ['UserID', 'Name', 'Phone', 'Role', 'Perms', 'PINHash', 'Salt', 'Status', 'FailedTries', 'LockedUntil', 'LastLogin', 'LockCount', 'MustChangePin'];
-const ACCT_COLS = ['MID', 'AccountName', 'HolderUserID', 'LinkedAt', 'LinkedBy', 'Reason'];
+const ACCT_COLS = ['MID', 'AccountName', 'HolderUserID', 'LinkedAt', 'LinkedBy', 'Reason', 'PrevHolder']; // PrevHolder = who held it before the last move (lets an undo bring back everything that moved together)
 const RECEIVE_EXTRA = ['Receipt No', 'Collected By', 'Entered At', 'Entered By', 'Account', 'Donor ID', 'SC Paid Later']; // Receive H:N
 const SCC_COLS = ['Date', 'MID', 'Name', 'Months', 'Amount', 'Account', 'Collected By', 'Receipt', 'Entered At', 'Entered By'];
 const EXP_EXTRA = ['Paid From', 'Voucher No', 'Entered At', 'Entered By']; // Expenses F:I
@@ -190,6 +190,7 @@ function setup() {
   ensureHeaders_(sh_(CFG.TABS.RECEIVE), 8, RECEIVE_EXTRA);
   ensureHeaders_(sh_(CFG.TABS.EXP), 6, EXP_EXTRA);
   ensureHeaders_(sh_(CFG.TABS.USERS), 12, ['LockCount', 'MustChangePin']);
+  ensureHeaders_(sh_(CFG.TABS.ACCTS), 7, ['PrevHolder']);
 
   // Accounts + users: one per Member ID, each is its own Account Holder at first.
   const users = rowsAsObjects_(CFG.TABS.USERS, USER_COLS);
@@ -200,7 +201,7 @@ function setup() {
   const newU = [], newA = [];
   Object.keys(info).forEach(mid => {
     if (mid === CFG.MOSJID_ID) return;
-    if (!haveA.has(mid)) newA.push([mid, info[mid].name, mid, new Date(), 'setup', 'initial import']);
+    if (!haveA.has(mid)) newA.push([mid, info[mid].name, mid, new Date(), 'setup', 'initial import', '']);
     if (!haveU.has(mid)) newU.push([mid, info[mid].name, info[mid].phone, 'member', '', '', '', 'active', 0, '', '', 0, '']);
   });
   if (newA.length) sh_(CFG.TABS.ACCTS).getRange(sh_(CFG.TABS.ACCTS).getLastRow() + 1, 1, newA.length, ACCT_COLS.length).setValues(newA);
@@ -294,7 +295,7 @@ function doPost(e) {
         transactions: () => { if (!isStaff_(u)) throw new Error('Not allowed'); return transactions_(b.limit || 50); },
         users: () => { requireAdmin_(u); return listUsers_(); },
         resetPin: () => { requireAdmin_(u); return resetPin_(u, b.userId, b.sendSms); },
-        setHolder: () => { requireAdmin_(u); return setHolder_(u, b.mid, b.holderUserId, b.reason); },
+        setHolder: () => { requireAdmin_(u); return setHolder_(u, b.mid, b.holderUserId, b.reason, b.dryRun === true); },
         addStaff: () => { requireAdmin_(u); const pin = newPin_(); addStaff_(b.userId, b.name, b.phone, b.role, b.perms, pin); return { pin }; },
         setPerms: () => { requireAdmin_(u); return setPerms_(u, b.userId, b.perms); },
         // Phase 2
@@ -729,30 +730,48 @@ function resetPin_(admin, userId, sendSms) {
  * Put an account (MID) under an Account Holder. Used for linking and for transfer.
  * If the MID was its own holder and held other accounts, those move too, and its login is switched off.
  */
-function setHolder_(admin, mid, holderUserId, reason) {
-  if (!reason) throw new Error('Reason is required');
+function setHolder_(admin, mid, holderUserId, reason, dryRun) {
+  if (!dryRun && !reason) throw new Error('Reason is required');
   const users = rowsAsObjects_(CFG.TABS.USERS, USER_COLS);
-  const holder = users.find(x => x.UserID === holderUserId);
-  if (holder && holderUserId === mid && holder.Status === 'linked') {
-    // Undo a mistaken link: the MID becomes its own Account Holder again.
-    holder.Status = 'active'; setCells_(CFG.TABS.USERS, holder._row, USER_COLS, holder);
-  }
-  if (!holder || holder.Status !== 'active') throw new Error('Account Holder must be an active login');
   const accts = rowsAsObjects_(CFG.TABS.ACCTS, ACCT_COLS);
+  const holder = users.find(x => x.UserID === holderUserId);
   const a = accts.find(x => x.MID === mid);
   if (!a) throw new Error('Unknown account');
-  const now = new Date();
-  const moved = [];
-  const move = (acc) => { acc.HolderUserID = holderUserId; acc.LinkedAt = now; acc.LinkedBy = admin.UserID; acc.Reason = reason; setCells_(CFG.TABS.ACCTS, acc._row, ACCT_COLS, acc); moved.push(acc.MID); };
-  move(a);
   const ownUser = users.find(x => x.UserID === mid);
-  if (ownUser && holderUserId !== mid) {
-    accts.filter(x => x.HolderUserID === mid && x.MID !== mid).forEach(move);
-    ownUser.Status = 'linked'; setCells_(CFG.TABS.USERS, ownUser._row, USER_COLS, ownUser);
-  }
-  audit_(admin, 'set_holder', { moved, to: holderUserId, reason });
-  sendSms_(holderUserId, holder.Phone, (getSettings_().SOMITI_NAME || 'At-Taqwa Somiti') + ': ' + moved.join(', ') + ' now linked to your app login ' + holderUserId + '.');
-  return { moved, to: holderUserId };
+  const undo = !!holder && holderUserId === mid && holder.Status === 'linked'; // the MID becomes its own Account Holder again
+  if (!holder || (holder.Status !== 'active' && !undo)) throw new Error('Account Holder must be an active login');
+  if (String(a.HolderUserID) === holderUserId && !undo) throw new Error(mid + ' is already under ' + holderUserId);
+  // Which accounts move:
+  //  - linking: the account itself + every account it was holding
+  //  - undo: the account itself + the accounts that moved away WITH it in that same link (same time, PrevHolder = this MID)
+  const same = (x, y) => x && y && new Date(x).getTime() === new Date(y).getTime();
+  const along = undo
+    ? accts.filter(x => x.MID !== mid && String(x.PrevHolder || '') === mid && String(x.HolderUserID) === String(a.HolderUserID) && same(x.LinkedAt, a.LinkedAt))
+    : (ownUser && holderUserId !== mid ? accts.filter(x => x.HolderUserID === mid && x.MID !== mid) : []);
+  const loginOff = !undo && !!ownUser && holderUserId !== mid && ownUser.Status === 'active';
+  const plan = { mid, to: holderUserId, toName: holder.Name, from: String(a.HolderUserID || ''), moved: [mid].concat(along.map(x => x.MID)), loginOff, loginOn: undo, undo };
+  if (dryRun) return plan;
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error('Another save is running. Try again in a moment.');
+  try {
+    const now = new Date();
+    if (undo) { holder.Status = 'active'; setCells_(CFG.TABS.USERS, holder._row, USER_COLS, holder); }
+    [a].concat(along).forEach(acc => {
+      acc.PrevHolder = acc.HolderUserID; acc.HolderUserID = holderUserId; acc.LinkedAt = now; acc.LinkedBy = admin.UserID; acc.Reason = reason;
+      setCells_(CFG.TABS.ACCTS, acc._row, ACCT_COLS, acc);
+    });
+    if (loginOff) { ownUser.Status = 'linked'; setCells_(CFG.TABS.USERS, ownUser._row, USER_COLS, ownUser); }
+    SpreadsheetApp.flush();
+    audit_(admin, undo ? 'undo_link' : 'set_holder', { moved: plan.moved, from: plan.from, to: holderUserId, reason });
+    markDirty_();
+  } finally { lock.releaseLock(); }
+  const name = getSettings_().SOMITI_NAME || 'At-Taqwa Somiti';
+  sendSms_(holderUserId, holder.Phone, name + ': ' + plan.moved.join(', ') + ' now linked to your app login ' + holderUserId + '.');
+  // tell the previous holder too, so nobody keeps expecting to see an account that has moved away
+  const prev = users.find(x => x.UserID === plan.from);
+  if (prev && plan.from !== holderUserId && plan.from !== mid) sendSms_(plan.from, prev.Phone, name + ': ' + plan.moved.join(', ') + ' no longer linked to your app login ' + plan.from + '.');
+  return plan;
 }
 
 function setPerms_(admin, userId, perms) {
