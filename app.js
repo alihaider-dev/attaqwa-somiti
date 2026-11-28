@@ -584,7 +584,7 @@
         $('#shr').onclick = () => shareReceipt({ receipt: r.receipt, member: r.mid + ' · ' + r.name, forText: r.months.length > 1 ? r.months[0] + ' to ' + r.months[r.months.length - 1] + ' (' + r.months.length + ' months)' : r.months[0], date: dateTxt, collectedBy: cbv, amount: r.total });
         $('#newp').onclick = () => again('member');
         window.scrollTo(0, 0);
-        if (r.smsPending) apiLive('sendQueued', { key: r.receipt }).then((q) => { const el = $('#smsst'); if (el) el.textContent = /^200/.test(q.sms) ? 'sent ✓' : q.sms; })
+        if (r.smsPending) apiLive('sendQueued', { key: r.receipt }).then((q) => { const el = $('#smsst'); if (el) el.textContent = q.sms === 'sent' ? 'sent ✓' : q.sms; if (q.sms !== 'sent') el.style.color = 'var(--red)'; })
           .catch(() => { const el = $('#smsst'); if (el) el.textContent = 'will be sent in a few minutes'; });
       } catch (e) {
         if (/Months changed/.test(e.message)) { clearCache(); toast(e.message, 7000); viewPay([mid]); return; }

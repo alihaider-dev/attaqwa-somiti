@@ -684,6 +684,16 @@ function smsToHolder_(mid, msg) {
   const sms = sendSms_(h.to, h.phone, msg);
   return { sms, wa: waLink_(h.phone, msg), waOnly: !normPhone_(h.phone) && !!waNumber_(h.phone) };
 }
+/**
+ * The SMS provider answers HTTP 200 even when it refuses the SMS; the real answer is response_code in the body
+ * (202 = accepted). Returns exactly 'sent' on success, otherwise 'not sent: <reason>'.
+ */
+function smsResult_(http, body) {
+  let j = null; try { j = JSON.parse(body); } catch (e) { j = null; }
+  if (j && (Number(j.response_code) === 202 || String(j.success_message || '').trim())) return 'sent';
+  if (j) return 'not sent: ' + (String(j.error_message || '').trim() || 'provider code ' + j.response_code) + ' (code ' + j.response_code + ')';
+  return 'not sent: HTTP ' + http + ' ' + String(body || '').slice(0, 120);
+}
 function sendSms_(to, phone, msg) {
   const num = normPhone_(phone);
   let result;
@@ -691,12 +701,16 @@ function sendSms_(to, phone, msg) {
   else {
     try {
       const p = props_();
-      const url = 'https://bulksmsbd.net/api/smsapi?api_key=' + encodeURIComponent(p.getProperty('BULKSMS_API_KEY') || '') +
-        '&type=text&number=' + num + '&senderid=' + encodeURIComponent(p.getProperty('BULKSMS_SENDER_ID') || '') +
-        '&message=' + encodeURIComponent(msg);
-      const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-      result = res.getResponseCode() + ' ' + res.getContentText().slice(0, 200);
-    } catch (e) { result = 'error: ' + e.message; }
+      const key = String(p.getProperty('BULKSMS_API_KEY') || '').trim(), sid = String(p.getProperty('BULKSMS_SENDER_ID') || '').trim();
+      if (!key || !sid) result = 'not sent: SMS key or sender ID is not set (Apps Script > Project Settings > Script Properties)';
+      else {
+        const url = 'https://bulksmsbd.net/api/smsapi?api_key=' + encodeURIComponent(key) +
+          '&type=text&number=' + num + '&senderid=' + encodeURIComponent(sid) +
+          '&message=' + encodeURIComponent(msg);
+        const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+        result = smsResult_(res.getResponseCode(), res.getContentText());
+      }
+    } catch (e) { result = 'not sent: ' + e.message; }
   }
   sh_(CFG.TABS.SMS).appendRow([new Date(), to, num || phone, msg, result]);
   return result;
@@ -1573,6 +1587,10 @@ function getDoc_(u, fileId) {
 /* ---------------- data check ---------------- */
 function dataHealth_() {
   const info = readInfo_(); const issues = [];
+  const pr = props_();
+  if (String(getSettings_().SMS_ON_PAYMENT).toUpperCase() === 'YES' && (!String(pr.getProperty('BULKSMS_API_KEY') || '').trim() || !String(pr.getProperty('BULKSMS_SENDER_ID') || '').trim())) issues.push({ mid: '', name: 'SMS', issue: 'SMS key or sender ID is not set, so no SMS is sent' });
+  const lastSms = rowsAsObjects_(CFG.TABS.SMS, ['Time', 'To', 'Number', 'Message', 'Result']).slice(-1)[0];
+  if (lastSms && /^not sent/.test(String(lastSms.Result))) issues.push({ mid: '', name: 'SMS', issue: 'Last SMS was ' + String(lastSms.Result).slice(0, 120) });
   const users = rowsAsObjects_(CFG.TABS.USERS, USER_COLS);
   Object.keys(info).forEach(mid => {
     if (mid === CFG.MOSJID_ID) return; const i = info[mid]; const f = i.fields;
