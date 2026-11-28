@@ -652,6 +652,21 @@ function addMosjid_(u, b) {
     result = { receipt, amount: total, donors: donors.map(d => d.name + ' ' + d.amount).join(', ') };
     audit_(u, 'add_mosjid', result);
   } finally { lock.releaseLock(); }
+  // Donors who are members get a confirmation, like a deposit does. Foreign numbers get a WhatsApp link instead.
+  if (b.sendSms !== false && String(getSettings_().SMS_ON_PAYMENT).toUpperCase() === 'YES') {
+    const name = getSettings_().SOMITI_NAME || 'At-Taqwa Somiti'; const queue = []; result.wa = [];
+    donors.filter(d => d.mid).forEach(d => {
+      const h = holderPhone_(d.mid);
+      const msg = name + ': Mosjid Fund donation ' + d.amount.toLocaleString('en-US') + ' Tk received from ' + d.mid + ' (' + d.name + '). JazakAllah. Receipt ' + result.receipt;
+      if (normPhone_(h.phone)) queue.push({ to: h.to, phone: h.phone, msg });
+      else if (waNumber_(h.phone)) result.wa.push({ name: d.name, link: waLink_(h.phone, msg) });
+    });
+    if (queue.length) {
+      if (b.deferSms === true) { queueSms_(result.receipt, queue); result.smsPending = true; }
+      else { const rs = queue.map(it => sendSms_(it.to, it.phone, it.msg)); result.sms = rs.every(x => x === 'sent') ? 'sent' : rs.find(x => x !== 'sent'); }
+      result.smsCount = queue.length;
+    }
+  }
   return result;
 }
 
@@ -1282,9 +1297,9 @@ function sendQueued_(key) {
   let raw;
   try { raw = p.getProperty(name); if (raw) p.deleteProperty(name); } finally { lock.releaseLock(); }
   if (!raw) return { sms: 'already sent' };
-  let first = '';
-  JSON.parse(raw).items.forEach((it, i) => { const r = sendSms_(it.to, it.phone, it.msg); if (i === 0) first = r; });
-  return { sms: first };
+  // 'sent' only when every message was accepted; otherwise the first reason it was refused
+  const rs = JSON.parse(raw).items.map(it => sendSms_(it.to, it.phone, it.msg));
+  return { sms: rs.every(x => x === 'sent') ? 'sent' : rs.find(x => x !== 'sent'), count: rs.length, sent: rs.filter(x => x === 'sent').length };
 }
 /** Timer: send any SMS the app never asked for (app closed right after saving). */
 function sweepSms_() {

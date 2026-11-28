@@ -518,9 +518,14 @@
         b.disabled = true; b.textContent = 'Saving…';
         try {
           remember();
-          const r = await api('addMosjid', { donors, depositDate: $('#dd').value, collectedBy: $('#cb').value, account: $('#acct').value });
+          const r = await api('addMosjid', { donors, depositDate: $('#dd').value, collectedBy: $('#cb').value, account: $('#acct').value, deferSms: true });
           const dateTxt = $('#dd').value;
-          view.innerHTML = '<div class="card"><h2>✅ Saved</h2>' + kvRow('Receipt', r.receipt) + kvRow('Total', tk(r.amount) + ' Tk') + kvRow('Donors', r.donors) + '<button class="btn sec" id="shr">Share receipt image</button><button class="btn" id="newp">New entry</button></div>';
+          view.innerHTML = '<div class="card"><h2>✅ Saved</h2>' + kvRow('Receipt', r.receipt) + kvRow('Total', tk(r.amount) + ' Tk') + kvRow('Donors', r.donors) +
+            (r.smsPending ? '<div class="kv"><span class="l">SMS to ' + r.smsCount + ' member donor' + (r.smsCount > 1 ? 's' : '') + '</span><span class="v muted" id="smsst">sending…</span></div>' : '') +
+            (r.wa || []).map((w) => '<a class="btn" style="background:#25D366" href="' + esc(w.link) + '" target="_blank" rel="noopener">Send on WhatsApp to ' + esc(w.name) + '</a>').join('') +
+            '<button class="btn sec" id="shr">Share receipt image</button><button class="btn" id="newp">New entry</button></div>';
+          if (r.smsPending) apiLive('sendQueued', { key: r.receipt }).then((q) => { const el = $('#smsst'); if (el) { el.textContent = q.sms === 'sent' ? 'sent ✓' : q.sms; if (q.sms !== 'sent') el.style.color = 'var(--red)'; } })
+            .catch(() => { const el = $('#smsst'); if (el) el.textContent = 'will be sent in a few minutes'; });
           $('#shr').onclick = () => shareReceipt({ receipt: r.receipt, member: 'Mosjid Fund donation', forText: r.donors, date: dateTxt, amount: r.amount });
           $('#newp').onclick = () => again('mosjid');
         } catch (e) { $('#perr').textContent = e.message; toast(e.message, 6000); b.disabled = false; b.textContent = 'Save'; }
